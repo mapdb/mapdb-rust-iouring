@@ -1,0 +1,28 @@
+# Destructive test tooling for the external crash tier. NOT part of the shipped
+# `mapdb-uring` package and never published: `ci/crash/*.sh` builds it explicitly.
+# It uses only the library's public API, so it imposes no support obligation on
+# `mapdb-uring` beyond what any user already has.
+[package]
+name = "mapdb-uring-crash-harness"
+edition = "2021"
+version = "0.1.0"
+license = "EPL-1.0 OR BSD-3-Clause"
+publish = false
+description = "Deterministic workload generator, intent journal and checker for the mapdb-uring crash tier"
+
+[dependencies]
+mapdb-uring = { path = "../.." }
+crc32c = "0.6"
+futures-lite = "2"
+
+[lib]
+name = "mapdb_uring_crash_harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crash_workload"
+path = "src/bin/crash_workload.rs"
+
+[[bin]]
+name = "crash_check"
+path = "src/bin/crash_check.rs"

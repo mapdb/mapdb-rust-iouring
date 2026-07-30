@@ -1,0 +1,5 @@
+/target
+*.swp
+# Stray benchmark scratch files (io_boundary writes to the crate dir on panic).
+/mapdb-io-bench*
+.claude/

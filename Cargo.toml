@@ -1,0 +1,121 @@
+[workspace]
+members = ["tools/crash-harness"]
+
+[package]
+name = "mapdb-uring"
+edition = "2021"
+version = "0.1.0"
+license = "EPL-1.0 OR BSD-3-Clause"
+description = "Linux-first asynchronous page stores (StoreDirect, StoreWal) and a limited B+tree map, io_uring-backed"
+repository = "https://github.com/mapdb/mapdb-rust-uring"
+readme = "README.md"
+# Governs the DEFAULT-FEATURE graph, verified on a real 1.75 toolchain. The
+# optional io-uring feature needs Rust >= 1.85: its locked graph contains
+# edition2024 crates (compio-send-wrapper) that older cargo cannot parse.
+rust-version = "1.75"
+
+[dependencies]
+# Root publication: one atomic (root, file-generation) Arc swap.
+arc-swap = "1.7"
+# Short, non-awaiting metadata critical sections only. Never held across .await.
+parking_lot = "0.12"
+# Bounded actor/driver command channels.
+async-channel = "2"
+# Frontier / poison / close predicate notifications.
+event-listener = "5"
+# Public interoperability + the later scan stream.
+futures-core = "0.3"
+# Oneshot reply channels for actor command completion.
+futures-channel = "0.3"
+# Actor-thread block_on loop (runtime-neutral).
+futures-lite = "2"
+# Page + record checksums. crc32c is the v1 default; crc32fast is a comparator.
+crc32c = "0.6"
+crc32fast = "1.4"
+# The clean tier of the page cache (G3 closed: ADOPT — the custom CLOCK
+# evictor is deleted). The `=` pin is an **audit boundary**: the
+# map→shard lock order, `on_evict`-touches-only-an-atomic, and `remove`-bypasses-
+# `on_evict` facts were audited against 0.6.24 internals; any version bump
+# requires a focused re-audit of those three facts before relaxing the pin.
+quick_cache = "=0.6.24"
+# Positional pread/pwrite/fdatasync for the always-available syscall fallback
+# PageIo (io::SyscallIo). No async runtime — a small dedicated worker pool.
+libc = "0.2"
+# The io_uring production boundary selected at M1 (io::CompioIo). Compio's
+# low-level Proactor is driven on a dedicated thread; the rest of the engine
+# stays runtime-neutral behind `Arc<dyn PageIo>`. Gated so the core crate and
+# the syscall fallback build without the heavier proactor dependency tree.
+compio-driver = { version = "0.12", optional = true }
+compio-buf = { version = "0.8", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+# M5 load/interop gate. Dev-only: these compile for tests/examples/benches, never
+# for a plain library `cargo build`, so the shipped crate's dependency surface is
+# unchanged. The engine is runtime-neutral; these prove it empirically.
+#   tokio+axum — the real-framework interop example and the multi-thread spawn
+#     interop test (futures crossing worker threads mid-poll).
+#   smol — a second, independent foreign reactor for the interop round-trip.
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "net", "time", "signal", "io-util", "sync"] }
+axum = "0.7"
+smol = "2"
+
+[features]
+default = []
+# The M1-selected io_uring boundary (io::CompioIo) + the cold-file boundary
+# benchmark. Off by default so `cargo build`/M0 tests need no proactor tree;
+# CI and the benchmark enable it. SyscallIo is always available without it.
+io-uring = ["dep:compio-driver", "dep:compio-buf"]
+# M7-E decision harness: exposes a bench-only device-wrapper hook on `Options`
+# (`Options::device_wrapper`) + a public `IoRole` so a benchmark can wrap every
+# device the production `create_path`/`open_path` mints — data file, rotated WAL
+# segments, compaction temps — in a counting/tracing decorator, without a fallback
+# to the caller-supplied-device path (which has no checkpoint). Off by default: a
+# plain build and the shipping public API are unchanged. KEPT past the M7-E
+# close: the decision closed UNRESOLVED with pre-registered re-open conditions
+# whose quiet-host rerun needs exactly this apparatus and the perf_knobs
+# bench. Delete only if the re-open conditions are themselves retired.
+bench-instrument = []
+[[bench]]
+name = "io_boundary"
+harness = false
+required-features = ["io-uring"]
+
+# M5 store-path benchmarks: read/get_many/flush/commit/cache/cold-hot table.
+[[bench]]
+name = "store_bench"
+harness = false
+
+
+
+# M6 Phase G / G1: the store-path CompioIo-vs-SyscallIo comparison M5 never ran —
+# resolves the M1/M3 io_uring-default re-decision gate.
+[[bench]]
+name = "io_default"
+harness = false
+required-features = ["io-uring"]
+
+# M7-E "the decision": re-runs the G1 A/B on the PRODUCTION `create_path`, on the
+# instrumented factory seam, and adopts/rejects each perf knob (io_uring default,
+# direct_io, flush fan-out, SQPOLL) with data. Fixes every Phase-G
+# harness defect the G1 bench carries (clock-before-spawn, 4-RMW counter, 2%
+# unequal-I/O tolerance, no-checkpoint proxy path). Needs both the proactor and the
+# bench-only device-wrapper hook.
+[[bench]]
+name = "perf_knobs"
+harness = false
+required-features = ["io-uring", "bench-instrument"]
+
+# M5: Tokio + Axum interop service over StoreWal.
+[[example]]
+name = "axum_kv"
+
+# SortedMap tour: path-backed StoreWal, scans both directions, pagination,
+# NavigableMap lookups, remove_range, reopen/recovery. Runtime-neutral.
+[[example]]
+name = "sorted_kv"
+
+[lib]
+name = "mapdb_uring"
+path = "src/lib.rs"

@@ -1,0 +1,42 @@
+# Depth campaign for the external crash tier: ~20 cuts per cell,
+# weekly + on demand. This SUPPLEMENTS the always-on 3-round crash-tier job in
+# ci.yml — it never substitutes for it.
+# The maint-open-at-cut count each cell prints matters here: it counts rounds
+# whose cut left an unmatched `M begin` at the witness cutoff. It is evidence
+# the cut landed near maintenance, NOT proof it landed inside it (the process
+# may die before the `M done` sync) — and while it stays 0 the campaign must
+# not claim any mid-maintenance coverage at all.
+name: crash-campaign
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 0"
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [direct, wal]
+        fs: [ext4, xfs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked -p mapdb-uring-crash-harness --bins
+      # device-mapper userspace + xfsprogs installed explicitly — an
+      # unattended first run must not rely on incidental runner state.
+      - run: sudo apt-get update && sudo apt-get install -y dmsetup xfsprogs
+      - run: >
+          sudo env GIT_REV=$GITHUB_SHA ci/crash/crash-tier.sh
+          --backend ${{ matrix.backend }} --fs ${{ matrix.fs }} --rounds 20
+          --workload $PWD/target/debug/crash_workload
+          --checker $PWD/target/debug/crash_check
+          --work /tmp/crash-campaign
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-campaign-${{ matrix.backend }}-${{ matrix.fs }}
+          path: /tmp/crash-campaign
+          if-no-files-found: ignore

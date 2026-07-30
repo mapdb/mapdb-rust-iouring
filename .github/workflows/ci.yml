@@ -1,0 +1,134 @@
+# Baseline CI. The repository had no remote when this was authored; it is
+# the ready-to-run mirror of ci/check.sh and activates when the repo is pushed to
+# GitHub. Policy: the dedicated ring job FAILS if io_uring cannot
+# be exercised; generic runners may skip individual ring tests. Every job resolves
+# dependencies against the committed Cargo.lock (--locked) so drift is visible,
+# never silently re-resolved.
+name: ci
+on: [push, pull_request]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # The crash harness is a separate, unpublished workspace member; a root
+      # --all-targets pass does not reach it.
+      - run: cargo clippy --locked --all-targets -p mapdb-uring-crash-harness -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --features io-uring
+      # Unprivileged process-crash tier: SIGKILL + reopen through the real
+      # syscall path. Not a power-cut claim — that is crash-tier.
+      - run: ci/crash/crash-smoke.sh
+
+  # Pinned-graph MSRV job. Scope corrected by MEASUREMENT ON A REAL 1.75
+  # TOOLCHAIN (2026-07-18, rustup 1.75.0): rust-version = 1.75
+  # governs the published crate's DEFAULT-FEATURE graph, which checks clean
+  # (`cargo check --locked`). The optional io-uring feature graph does NOT
+  # hold 1.75: compio-send-wrapper 0.7.2 uses edition2024, which cargo 1.75
+  # cannot even parse — a fact invisible to the earlier rust-version-field
+  # audit (edition requirements are a separate axis; the --all-features form
+  # of this job would have failed its first run). io-uring therefore requires
+  # Rust >= 1.85 and is exercised on stable by the gate job. The dev graph
+  # (proptest / smol / tempfile→getrandom, rust-version 1.85) remains outside
+  # the MSRV claim as before.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.75"
+      - run: cargo check --locked
+
+  # Dedicated ring job: must FAIL (not skip) when the ring cannot be exercised.
+  # MAPDB_REQUIRE_URING flips the in-suite canary (io/mod.rs ring_canary) from
+  # skip-quietly to hard failure AND the canary positively asserts one Compio
+  # round trip (write + datasync + read) completed — a printed skip count is
+  # ignorable, a red job is not (this replaces an older tee+grep pattern,
+  # whose missing pipefail could mask a failing suite behind tee's exit 0).
+  ring-required:
+    runs-on: ubuntu-latest
+    env:
+      MAPDB_REQUIRE_URING: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --features io-uring
+
+  # Miri over the unsafe buffer-ownership boundaries (T3.5): the backend-free
+  # aligned-buffer suite and the pure DioBuf ownership/length tests. Real
+  # ring/syscall/O_DIRECT tests are outside these filters — Miri cannot run
+  # them and the exclusion is deliberate. The nightly is date-pinned so a
+  # floating-nightly breakage is never confused with a code regression; bump
+  # the date deliberately.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-30
+          components: miri
+      - run: cargo +nightly-2026-06-30 miri test --locked --lib io::aligned
+      - run: cargo +nightly-2026-06-30 miri test --locked --features io-uring --lib io::uring::dio_buf_tests
+
+  # The PRIVILEGED external crash tier (a
+  # release-gate item): suspend-and-image power-cut on real ext4/XFS over
+  # device-mapper, four independent cells, three cuts each. The binaries are
+  # built as the ordinary runner user; only the loop/dm/mkfs/mount
+  # orchestration runs under sudo, with absolute paths.
+  # The first green run of all four cells is what discharges the release
+  # gate — the YAML existing is not evidence.
+  crash-tier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [direct, wal]
+        fs: [ext4, xfs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked -p mapdb-uring-crash-harness --bins
+      # device-mapper userspace + xfsprogs installed explicitly — an
+      # unattended first run must not rely on incidental runner state.
+      - run: sudo apt-get update && sudo apt-get install -y dmsetup xfsprogs
+      - run: >
+          sudo env GIT_REV=$GITHUB_SHA ci/crash/crash-tier.sh
+          --backend ${{ matrix.backend }} --fs ${{ matrix.fs }} --rounds 3
+          --workload $PWD/target/debug/crash_workload
+          --checker $PWD/target/debug/crash_check
+          --work /tmp/crash-tier
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-tier-${{ matrix.backend }}-${{ matrix.fs }}
+          path: /tmp/crash-tier
+          if-no-files-found: ignore
+
+  # Dependency advisories against the committed lockfile (T3.5). The tool
+  # version is pinned and installed with its own lockfile so the gate is
+  # reproducible, and both the tool build and the advisory database are
+  # cached. Any advisory gets an explicit recorded disposition —
+  # nothing is pre-ignored. ci/check.sh runs the same
+  # audit locally.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+          key: cargo-audit-0.22.2
+      - run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version =0.22.2 --locked
+      - run: cargo audit
