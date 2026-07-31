@@ -8,16 +8,29 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# cargo resolves `fmt`/`clippy` through $CARGO_HOME/bin before $PATH; on hosts
+# where that directory holds only toolchain-less rustup shims the resolution
+# errors out, so fall back to the system cargo-fmt/cargo-clippy binaries.
+cargo_sub() {
+  local sub=$1
+  shift
+  if cargo "$sub" --version >/dev/null 2>&1; then
+    cargo "$sub" "$@"
+  else
+    "cargo-$sub" "$@"
+  fi
+}
+
 echo "== fmt =="
-cargo fmt --check
+cargo_sub fmt --check
 
 echo "== clippy (default) =="
-cargo clippy --locked --all-targets -- -D warnings
+cargo_sub clippy --locked --all-targets -- -D warnings
 
 echo "== clippy (crash harness workspace member) =="
 # The harness is a separate, unpublished workspace member; a root --all-targets
 # pass does not reach it.
-cargo clippy --locked --all-targets -p mapdb-uring-crash-harness -- -D warnings
+cargo_sub clippy --locked --all-targets -p mapdb-uring-crash-harness -- -D warnings
 
 echo "== test (default) =="
 cargo test --locked
