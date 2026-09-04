@@ -75,7 +75,7 @@ fn wal_drop_while_paused_applies_deferred_write_then_frees_path() {
     // Pause, then enqueue on the held permit: the command lands in the parked
     // writer's deferred queue (or the channel — equivalent) and CANNOT apply
     // until the pause ends... which no one will ever end.
-    assert!(store.begin_maintenance());
+    block_on(store.begin_maintenance()).unwrap();
     let outcome = permit.apply(batch);
     drop(outcome); // invariant 4: the enqueued command survives its future
 
@@ -137,7 +137,7 @@ fn paused_store_holds_its_lock_until_close() {
     let path = dir.join("store.data");
     let store = Store::<Direct>::create_path(&path, Options::default()).unwrap();
 
-    assert!(store.begin_maintenance());
+    block_on(store.begin_maintenance()).unwrap();
     match Store::<Direct>::open_path(&path, Options::default()) {
         Err(OpenError::AlreadyOpen) => {}
         Err(other) => panic!("expected AlreadyOpen, got {other:?}"),

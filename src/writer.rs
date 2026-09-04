@@ -92,6 +92,8 @@ impl Coordinator {
     }
 
     async fn flush_all(&mut self, core: &Arc<Core>) -> Result<(), Terminal> {
+        #[cfg(test)]
+        core.test_gates.flush.pass();
         match self {
             Coordinator::Direct(c) => c.flush_all(core).await,
             Coordinator::Wal(c) => c.commit_all(core).await,
@@ -213,12 +215,14 @@ fn run_loop(
                         // The phase can flip back to Running while this drain
                         // holds a command it already popped: a checkpoint or
                         // compact enqueued *after* `end_maintenance` must not
-                        // be failed `Compacting` (the
-                        // channel's acquire ordering makes this per-command
-                        // re-check sufficient: a command sent after the resume
-                        // is only observed together with the Running phase).
-                        // Defer it instead — deferred commands run first on
-                        // resume, so admission order is preserved.
+                        // be failed `Compacting`. The channel's acquire
+                        // ordering means a command sent under Running is never
+                        // observed together with a stale read of *this* pause;
+                        // under a resume/re-pause it may be observed with the
+                        // later pause, and failing it then is correct — it is
+                        // queued behind that operator-held pause. Defer it
+                        // instead — deferred commands run first on resume, so
+                        // admission order is preserved.
                         if core.state.phase() != Lifecycle::Maintenance {
                             deferred.push_back(cmd);
                             break;
@@ -240,6 +244,14 @@ fn run_loop(
                     if core.state.phase() != Lifecycle::Maintenance {
                         continue;
                     }
+                    // The parked barrier: no command is in flight (this is the loop
+                    // top), the flush above left nothing pending, and the phase was
+                    // observed as `Maintenance` *after* `listener` was registered —
+                    // so a re-pause after this ack notifies that listener and
+                    // re-runs this arm. Acknowledge the pause; `begin_maintenance`
+                    // resolves on this. Nothing below (the read-only load drive, the
+                    // park, deferring a received command) publishes or writes.
+                    core.state.ack_maintenance();
                     // H5 idle drive: reads stay admitted during a maintenance pause,
                     // which may be arbitrarily long (operator-controlled), so an
                     // orphaned load here needs the same wall-clock bound as the
@@ -654,6 +666,8 @@ async fn apply_batch(
     //    publication.
     let page_charge = reservation.hand_pages_to_frontier();
     let next = next_descriptor(&current, built.root, built.entry_count);
+    #[cfg(test)]
+    core.test_gates.publish.pass();
     core.root.store(Arc::new(next));
     coordinator.on_published(Published {
         txid: version.txid(),
@@ -804,12 +818,12 @@ async fn drain_and_finish(
 /// this read sees. It is a *sampled* check, not an atomic check-and-dispatch:
 /// nothing is held across the `apply_command().await` that follows, so a pause
 /// entered after this read returns `Running` does not stop the command it just
-/// released. That residue is inherent to `begin_maintenance` today — it flips an
-/// enum and returns without any writer acknowledgement, so a command already
-/// dispatched (or a flush already running) can still complete after it returns.
-/// Closing this properly needs a writer-ack handshake, which is deliberately not
-/// part of this fix; what is fixed here is the reverse and much wider window —
-/// applying a command the writer received *after* it could see the pause.
+/// released. That is fine because the pause is not *established* by the flip:
+/// `Store::begin_maintenance` waits for the writer to acknowledge it from the
+/// parked barrier in the `Maintenance` arm (`EngineState::ack_maintenance`),
+/// which the writer reaches only after the released command has completed and
+/// pending work has been flushed. So a command this check releases always
+/// lands before `begin_maintenance` returns, never after.
 fn defer_if_paused(
     core: &Arc<Core>,
     deferred: &mut std::collections::VecDeque<Command>,

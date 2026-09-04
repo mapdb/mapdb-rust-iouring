@@ -11,12 +11,12 @@ use crate::admission::{AdmissionLimits, Budget, Reservation, WalMeter, WalReserv
 use crate::backend::{Backend, Direct, FileGeneration, Member, Wal};
 use crate::batch::{ApplyOutcome, PageBatch, WriteBatch};
 use crate::direct::{direct_generation, Allocator, DirectCoordinator, FIRST_DATA_INDEX};
-use crate::error::{CheckpointError, OpenError, WriteError};
+use crate::error::{CheckpointError, MaintenanceError, OpenError, WriteError};
 use crate::io::PageIo;
 use crate::metrics::Metrics;
 use crate::page::{PageRef, PAGE_SIZE};
 use crate::retention::{GenHold, Retention, SnapshotGen};
-use crate::state::{EngineState, IntakeDecision};
+use crate::state::{EngineState, IntakeDecision, PauseStatus};
 use crate::version::{Incarnation, Version};
 use crate::wal::{wal_generation, WalCoordinator, WalLocator};
 use crate::writer::Coordinator;
@@ -109,6 +109,11 @@ pub(crate) struct Core {
     /// reopenable while handles linger; a dropped store's path becomes
     /// reopenable as soon as its writer drains.
     pub namespace_lock: parking_lot::Mutex<Option<std::fs::File>>,
+    /// Test-only synchronization points on the writer thread (a gated
+    /// publication, a gated flush), so a race window can be held open
+    /// deterministically instead of reproduced with sleeps.
+    #[cfg(test)]
+    pub test_gates: crate::state::TestGates,
     /// StoreWal only: the monotonic WAL-byte meter admission charges against
     /// (invariant 18). `None` for StoreDirect. The overlay locator lives in the
     /// `FileGeneration`; this is the byte budget the record reservations release
@@ -762,6 +767,8 @@ impl<B: Backend> Store<B> {
             max_data_bytes: options.max_data_bytes,
             checkpoints_skipped_space: std::sync::atomic::AtomicU64::new(0),
             namespace_lock: parking_lot::Mutex::new(namespace_lock),
+            #[cfg(test)]
+            test_gates: crate::state::TestGates::default(),
         });
         let (tx, rx) = async_channel::unbounded::<Command>();
         let writer_core = Arc::clone(&core);
@@ -795,8 +802,10 @@ impl<B: Backend> Store<B> {
         let incarnation = options.incarnation.unwrap_or_else(Incarnation::generate);
         let event = Arc::new(Event::new());
         let state = EngineState::new_running(Arc::clone(&event));
-        // Park admission: fresh writes fail fast with `Compacting`.
-        state.enter_maintenance();
+        // Park admission: fresh writes fail fast with `Compacting`. There is
+        // no writer to acknowledge the epoch, and nothing ever waits on it: a
+        // later `begin_maintenance` fails at once with `AlreadyPaused`.
+        let _ = state.enter_maintenance();
         let budget = Budget::new(options.limits, Arc::clone(&event));
         let files = Arc::new(files);
         let base = RootDescriptor {
@@ -832,6 +841,8 @@ impl<B: Backend> Store<B> {
             max_data_bytes: options.max_data_bytes,
             checkpoints_skipped_space: std::sync::atomic::AtomicU64::new(0),
             namespace_lock: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            test_gates: crate::state::TestGates::default(),
         });
         // A command channel is required by the type, but with no writer nothing
         // is ever sent (admission is parked). Drop the receiver.
@@ -885,21 +896,54 @@ impl<B: Backend> Store<B> {
 
     /// Enters maintenance: the writer parks between commands and fresh admission
     /// fails fast with `Compacting`. Already-queued reservations stay charged.
-    /// Returns `false` if the store is not `Running`.
     ///
-    /// This flips the phase and returns; it does **not** wait for a writer
-    /// acknowledgement. No command the writer receives after the flip is applied
-    /// (`writer::defer_if_paused`), but one already dispatched — or a flush
-    /// already running — can still complete after this returns. Note [`Store::compact`] and
-    /// [`Store::checkpoint`] do **not** use this — they run as writer commands;
-    /// this is the operator-controlled pause (e.g. for external backup).
+    /// Resolves `Ok` only once the pause is **established**: the writer has
+    /// finished any command it had already claimed, flushed every pending
+    /// batch, and acknowledged *this* pause from its parked barrier (see
+    /// `EngineState::ack_maintenance` / `pause_status`). After `Ok`, no root is
+    /// published and no data/WAL file is written or synced until
+    /// [`Store::end_maintenance`] — the guarantee an external backup needs. A
+    /// command enqueued on a permit taken before the pause is held (`writer.rs`
+    /// `defer_if_paused` / the parked `recv` arm) and applied first on resume.
+    ///
+    /// The guarantee holds for as long as the phase stays `Maintenance`: a
+    /// concurrent `end_maintenance` or `close()` (which applies and flushes
+    /// admitted work) ends it, as any concurrent operator action would.
+    ///
+    /// `Err` means the caller holds **no** such guarantee:
+    /// [`MaintenanceError::AlreadyPaused`] without waiting if the store was
+    /// already in `Maintenance`; [`MaintenanceError::Interrupted`] if another caller resumed
+    /// (and possibly re-paused — that pause is theirs) before the writer
+    /// acknowledged this one; `Poisoned`/`Closed` if the store went terminal
+    /// meanwhile — a close applies and flushes admitted work, so it is never
+    /// reported as a quiescent pause. A waiter is never stranded: every such
+    /// transition notifies it.
+    ///
+    /// Note [`Store::compact`] and [`Store::checkpoint`] do **not** use this —
+    /// they run as writer commands; this is the operator-controlled pause.
     ///
     /// Dropping every handle while paused is safe: the parked writer
     /// observes the command channel close, applies whatever was admitted,
     /// flushes, exits, and releases the sidecar lock — see
     /// `tests_handle_drop_lifecycle`.
-    pub fn begin_maintenance(&self) -> bool {
-        self.inner.core.state.enter_maintenance()
+    pub async fn begin_maintenance(&self) -> Result<(), MaintenanceError> {
+        let state = &self.inner.core.state;
+        let epoch = state.enter_maintenance()?;
+        // Standard listener discipline: check, listen, re-check, await.
+        loop {
+            match state.pause_status(epoch) {
+                PauseStatus::Established => return Ok(()),
+                PauseStatus::Aborted(e) => return Err(e),
+                PauseStatus::Waiting => {}
+            }
+            let listener = state.listen();
+            match state.pause_status(epoch) {
+                PauseStatus::Established => return Ok(()),
+                PauseStatus::Aborted(e) => return Err(e),
+                PauseStatus::Waiting => {}
+            }
+            listener.await;
+        }
     }
 
     /// Resumes from maintenance, waking parked writer and blocked admission.

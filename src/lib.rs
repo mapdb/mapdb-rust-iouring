@@ -108,8 +108,8 @@ pub use batch::{ApplyOutcome, BatchError, Check, Op, PageBatch, WriteBatch};
 pub use cache::{CacheMetrics, CacheState, PageCache};
 pub use compact::CompactReport;
 pub use error::{
-    CloseError, CommitError, FlushError, OpenError, PermitMismatch, PoisonReason, ReadError,
-    Terminal, WriteError,
+    CloseError, CommitError, FlushError, MaintenanceError, OpenError, PermitMismatch, PoisonReason,
+    ReadError, Terminal, WriteError,
 };
 pub use fileset::{MemWalFileSet, WalFileSet};
 #[cfg(feature = "bench-instrument")]

@@ -718,7 +718,7 @@ fn checkpoint_during_maintenance_fails_fast() {
     // queue behind an operator-held pause.
     let (map, _data, _fs) = owned_store();
     put(&map, b"k", b"v");
-    assert!(map.store().begin_maintenance());
+    block_on(map.store().begin_maintenance()).unwrap();
     assert!(matches!(
         block_on(map.store().checkpoint()),
         Err(CheckpointError::Compacting)
@@ -1236,11 +1236,20 @@ fn a_checkpoint_queued_before_maintenance_fails_fast_rather_than_waiting() {
         block_on(poll_once(&mut ckpt)).is_none(),
         "queued, not yet run"
     );
-    assert!(store.begin_maintenance());
+    // The pause starts (phase flips: the checkpoint is now overtaken) but is not
+    // established while the writer is inside the gated sync — that is the
+    // handshake's promise, so the pause future stays pending here.
+    let mut pause = Box::pin(store.begin_maintenance());
+    assert!(
+        block_on(poll_once(&mut pause)).is_none(),
+        "the pause must not be established while a commit is mid-sync"
+    );
 
     // Release: the writer finishes the commit, sees Maintenance, and must fail the
-    // queued checkpoint instead of parking with it still in the channel.
+    // queued checkpoint instead of parking with it still in the channel — and
+    // only then acknowledge the pause.
     seg.release_syncs(1);
+    block_on(pause).unwrap();
     let outcome = block_on(ckpt);
     assert!(
         matches!(outcome, Err(CheckpointError::Compacting)),
@@ -2472,7 +2481,7 @@ fn compaction_unsupported_without_a_namespace() {
 fn compaction_fails_fast_during_maintenance() {
     let (map, _host) = hosted_direct_store(Options::default());
     put_direct(&map, b"k", b"v");
-    assert!(map.store().begin_maintenance());
+    block_on(map.store().begin_maintenance()).unwrap();
     assert!(matches!(
         block_on(map.store().compact()),
         Err(CheckpointError::Compacting)
@@ -3947,10 +3956,7 @@ fn maintenance_writer_drives_an_orphaned_load() {
 
     // Pause into Maintenance: the writer leaves the Running idle arm and parks in
     // the Maintenance arm. (Reads remain admitted — that is the pause contract.)
-    assert!(
-        map.store().begin_maintenance(),
-        "begin_maintenance must succeed on a live store"
-    );
+    block_on(map.store().begin_maintenance()).unwrap();
 
     // Orphan a load *during the pause* — install + activity notify run synchronously
     // in `begin`; dropping the future unpolled leaves a parked `Loading` slot with no

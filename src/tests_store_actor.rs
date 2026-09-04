@@ -12,12 +12,12 @@
 use crate::admission::AdmissionLimits;
 use crate::backend::Direct;
 use crate::batch::{ApplyOutcome, WriteBatch};
-use crate::error::{PoisonReason, WriteError};
+use crate::error::{MaintenanceError, PoisonReason, WriteError};
 use crate::io::FakeIo;
 use crate::map::BTreeMap;
 use crate::store::{Options, Store};
 use crate::version::Incarnation;
-use futures_lite::future::block_on;
+use futures_lite::future::{block_on, poll_once};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -167,7 +167,7 @@ fn maintenance_pauses_writer_and_fails_fresh_admission() {
 
     // Permit obtained while Running.
     let permit = map.try_reserve_write(cost).unwrap();
-    assert!(map.store().begin_maintenance());
+    block_on(map.store().begin_maintenance()).unwrap();
 
     // Fresh admission now fails fast.
     assert!(matches!(
@@ -230,7 +230,7 @@ fn poison_wakes_queued_command() {
         .insert(b"k".to_vec(), b"v".to_vec())
         .cost(crate::store::DEPTH_BOUND);
     let permit = map.try_reserve_write(cost).unwrap();
-    assert!(map.store().begin_maintenance()); // park the writer
+    block_on(map.store().begin_maintenance()).unwrap(); // park the writer
     let fut = permit
         .apply(WriteBatch::new().insert(b"k".to_vec(), b"v".to_vec()))
         .unwrap_or_else(|_| panic!("cost within permit"));
@@ -333,7 +333,7 @@ fn close_drains_accepted_write() {
         .cost(crate::store::DEPTH_BOUND);
     // Park writer, enqueue, then close: the drain must apply the queued command.
     let permit = map.try_reserve_write(cost).unwrap();
-    assert!(map.store().begin_maintenance());
+    block_on(map.store().begin_maintenance()).unwrap();
     let _fut = permit
         .apply(WriteBatch::new().insert(b"k".to_vec(), b"v".to_vec()))
         .unwrap_or_else(|_| panic!("cost within permit"));
@@ -341,4 +341,224 @@ fn close_drains_accepted_write() {
     map.store().end_maintenance();
     block_on(map.close()).unwrap();
     assert_eq!(map.len(), 1, "accepted write applied before close finished");
+}
+
+/// `begin_maintenance` is a handshake, not an enum flip: it must not resolve
+/// while the writer is inside a command it claimed before the pause. Gate the
+/// writer immediately before publication, start the pause, and prove it stays
+/// pending until the gated command completes — and that the command *does*
+/// complete before the pause is established (it was admitted and claimed
+/// first), while a command enqueued after it is held for resume. Sleep-free:
+/// each negative assertion is a single `poll_once` on the pinned future while
+/// the writer is known to be blocked in the gate.
+#[test]
+fn begin_maintenance_waits_for_a_claimed_command_to_publish() {
+    let map = tiny_store(8, 64);
+    let core = &map.store().inner.core;
+    core.test_gates.publish.arm();
+
+    // The writer claims this command and blocks at the publish gate.
+    let in_flight = {
+        let map = map.clone();
+        std::thread::spawn(move || {
+            block_on(map.apply(WriteBatch::new().insert(b"a".to_vec(), b"1".to_vec())))
+        })
+    };
+    core.test_gates.publish.wait_arrived();
+    assert_eq!(map.len(), 0, "gated before publication");
+
+    // A permit taken while still Running: enqueue-allowed across the pause.
+    let cost = WriteBatch::new()
+        .insert(b"b".to_vec(), b"2".to_vec())
+        .cost(crate::store::DEPTH_BOUND);
+    let permit = map.try_reserve_write(cost).unwrap();
+
+    let mut pause = Box::pin(map.store().begin_maintenance());
+    assert!(
+        block_on(poll_once(&mut pause)).is_none(),
+        "begin_maintenance resolved while a claimed command was still in flight"
+    );
+    // Fresh admission fails fast as soon as the phase flips...
+    assert!(matches!(
+        map.try_reserve_write(cost),
+        Err(WriteError::Compacting)
+    ));
+    // ...but the pause is still not established: the writer is mid-command.
+    assert!(block_on(poll_once(&mut pause)).is_none());
+    assert_eq!(map.len(), 0);
+
+    // The held command lands *before* the pause completes.
+    core.test_gates.publish.release();
+    block_on(pause).unwrap();
+    assert!(matches!(
+        in_flight.join().unwrap().unwrap(),
+        ApplyOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        map.len(),
+        1,
+        "the claimed command published before the pause was established"
+    );
+
+    // Anything enqueued now waits for resume.
+    let mut later = Box::pin(
+        permit
+            .apply(WriteBatch::new().insert(b"b".to_vec(), b"2".to_vec()))
+            .unwrap_or_else(|_| panic!("cost within permit")),
+    );
+    assert!(block_on(poll_once(&mut later)).is_none(), "held for resume");
+    assert_eq!(map.len(), 1);
+    map.store().end_maintenance();
+    assert!(matches!(
+        block_on(later).unwrap(),
+        ApplyOutcome::Applied { .. }
+    ));
+    assert_eq!(map.len(), 2);
+    block_on(map.close()).unwrap();
+}
+
+/// `begin_maintenance` must not resolve while a flush is running, and the
+/// established pause must have made everything published so far durable.
+#[test]
+fn begin_maintenance_waits_for_a_running_flush() {
+    let map = tiny_store(8, 64);
+    let core = &map.store().inner.core;
+    core.test_gates.flush.arm();
+
+    // Publishes, then the writer idles into `flush_all` and blocks at the gate.
+    let outcome =
+        block_on(map.apply(WriteBatch::new().insert(b"k".to_vec(), b"v".to_vec()))).unwrap();
+    let version = match outcome {
+        ApplyOutcome::Applied { version, .. } => version,
+        other => panic!("expected Applied, got {other:?}"),
+    };
+    core.test_gates.flush.wait_arrived();
+    assert!(
+        core.durable_txid.load(std::sync::atomic::Ordering::Acquire) < version.txid(),
+        "flush gated before it advanced durability"
+    );
+
+    let mut pause = Box::pin(map.store().begin_maintenance());
+    assert!(
+        block_on(poll_once(&mut pause)).is_none(),
+        "begin_maintenance resolved while a flush was still running"
+    );
+    assert_eq!(core.state.phase(), crate::state::Lifecycle::Maintenance);
+
+    core.test_gates.flush.release();
+    block_on(pause).unwrap();
+    assert!(
+        core.durable_txid.load(std::sync::atomic::Ordering::Acquire) >= version.txid(),
+        "an established pause has flushed everything published before it"
+    );
+    map.store().end_maintenance();
+    block_on(map.close()).unwrap();
+}
+
+/// A poison while the writer is stuck mid-command must release a pending
+/// `begin_maintenance` (invariant 6: terminal transitions wake every waiter
+/// class) — as a **failure**: the in-flight command may still publish, so the
+/// caller must not be told the store is quiescent.
+#[test]
+fn begin_maintenance_is_failed_by_poison() {
+    let map = tiny_store(8, 64);
+    let core = &map.store().inner.core;
+    core.test_gates.publish.arm();
+    let in_flight = {
+        let map = map.clone();
+        std::thread::spawn(move || {
+            block_on(map.apply(WriteBatch::new().insert(b"a".to_vec(), b"1".to_vec())))
+        })
+    };
+    core.test_gates.publish.wait_arrived();
+
+    let mut pause = Box::pin(map.store().begin_maintenance());
+    assert!(block_on(poll_once(&mut pause)).is_none());
+
+    core.state.poison(PoisonReason::Corrupt("mid-pause"));
+    assert!(
+        matches!(block_on(pause), Err(MaintenanceError::Poisoned(_))),
+        "a terminal transition aborts the pause, never establishes it"
+    );
+    core.test_gates.publish.release();
+    let _ = in_flight.join().unwrap();
+}
+
+/// Waiter-side ABA at the store level: a pause resumed by another caller — and
+/// possibly re-entered by them — is `Interrupted` for its original waiter, even
+/// though the phase reads `Maintenance` again; the re-entered pause belongs to
+/// the second caller and is established for *them* only once the writer acks
+/// it.
+#[test]
+fn begin_maintenance_is_interrupted_by_a_concurrent_resume_and_repause() {
+    let map = tiny_store(8, 64);
+    let core = &map.store().inner.core;
+    core.test_gates.publish.arm();
+    let in_flight = {
+        let map = map.clone();
+        std::thread::spawn(move || {
+            block_on(map.apply(WriteBatch::new().insert(b"a".to_vec(), b"1".to_vec())))
+        })
+    };
+    core.test_gates.publish.wait_arrived();
+
+    let mut first = Box::pin(map.store().begin_maintenance());
+    assert!(block_on(poll_once(&mut first)).is_none());
+    // Another operator resumes and immediately re-pauses.
+    map.store().end_maintenance();
+    let mut second = Box::pin(map.store().begin_maintenance());
+    assert!(block_on(poll_once(&mut second)).is_none());
+    assert_eq!(core.state.phase(), crate::state::Lifecycle::Maintenance);
+
+    assert!(
+        matches!(block_on(first), Err(MaintenanceError::Interrupted)),
+        "the first pause was resumed under the waiter; the re-pause is not theirs"
+    );
+    // A third caller while paused does not own the pause either.
+    assert!(matches!(
+        block_on(map.store().begin_maintenance()),
+        Err(MaintenanceError::AlreadyPaused)
+    ));
+
+    core.test_gates.publish.release();
+    block_on(second).unwrap();
+    assert!(matches!(
+        in_flight.join().unwrap().unwrap(),
+        ApplyOutcome::Applied { .. }
+    ));
+    assert_eq!(map.len(), 1);
+    map.store().end_maintenance();
+    block_on(map.close()).unwrap();
+}
+
+/// A concurrent `close()` aborts a pending pause with `Closed`: closing applies
+/// and flushes admitted work, so it is not a quiescent barrier.
+#[test]
+fn begin_maintenance_is_failed_by_close() {
+    let map = tiny_store(8, 64);
+    let core = &map.store().inner.core;
+    core.test_gates.publish.arm();
+    let in_flight = {
+        let map = map.clone();
+        std::thread::spawn(move || {
+            block_on(map.apply(WriteBatch::new().insert(b"a".to_vec(), b"1".to_vec())))
+        })
+    };
+    core.test_gates.publish.wait_arrived();
+
+    let mut pause = Box::pin(map.store().begin_maintenance());
+    assert!(block_on(poll_once(&mut pause)).is_none());
+
+    let closer = {
+        let map = map.clone();
+        std::thread::spawn(move || block_on(map.close()))
+    };
+    spin_until(|| core.state.phase() == crate::state::Lifecycle::Closing);
+    assert!(matches!(block_on(pause), Err(MaintenanceError::Closed)));
+    core.test_gates.publish.release();
+    assert!(matches!(
+        in_flight.join().unwrap().unwrap(),
+        ApplyOutcome::Applied { .. }
+    ));
+    closer.join().unwrap().unwrap();
 }

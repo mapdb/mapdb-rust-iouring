@@ -272,6 +272,39 @@ impl From<Terminal> for CheckpointError {
     }
 }
 
+/// Failure of [`Store::begin_maintenance`](crate::Store::begin_maintenance):
+/// the operator pause was **not established**. Whatever the variant, the caller
+/// holds no quiescence guarantee and must not start an external backup.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum MaintenanceError {
+    /// The store was already paused when this call was made (by another
+    /// caller, or because it is a read-only fixture with no writer). This call
+    /// did not enter the pause and does not own it.
+    AlreadyPaused,
+    /// The pause this call entered was no longer the active one when
+    /// establishment was checked: a concurrent `end_maintenance`, possibly
+    /// followed by a fresh `begin_maintenance` from another caller (which owns
+    /// *its* pause; this one does not). This is reported even if the writer had
+    /// acknowledged the original pause before it was resumed.
+    Interrupted,
+    /// The store poisoned before the pause was established.
+    Poisoned(PoisonReason),
+    /// The store closed (or began closing) before the pause was established.
+    /// A close applies and flushes admitted work, so it is not a quiescent
+    /// barrier.
+    Closed,
+}
+
+impl From<Terminal> for MaintenanceError {
+    fn from(t: Terminal) -> Self {
+        match t {
+            Terminal::Poisoned(r) => MaintenanceError::Poisoned(r),
+            Terminal::Closed => MaintenanceError::Closed,
+        }
+    }
+}
+
 /// Failure of `close()`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -336,6 +369,7 @@ impl_display_debug!(
     FlushError,
     CommitError,
     CheckpointError,
+    MaintenanceError,
     CloseError,
     PermitMismatch
 );
