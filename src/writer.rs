@@ -304,7 +304,14 @@ fn run_loop(
             }
 
             // Commands parked by a maintenance pause run first: they were admitted
-            // before anything still in the channel.
+            // before anything still in the channel. Re-check the pause: it can be
+            // re-entered between the loop-top read and this pop (see
+            // `defer_if_paused` for the ordering); park instead of applying. The
+            // check is before the pop, not after — popping and re-queueing would
+            // rotate `deferred` and break FIFO.
+            if !deferred.is_empty() && core.state.phase() == Lifecycle::Maintenance {
+                continue;
+            }
             if let Some(cmd) = deferred.pop_front() {
                 apply_command(&core, &mut coordinator, cmd).await;
                 if coordinator.should_flush(
@@ -326,6 +333,9 @@ fn run_loop(
 
             match commands.try_recv() {
                 Ok(cmd) => {
+                    let Some(cmd) = defer_if_paused(&core, &mut deferred, cmd) else {
+                        continue;
+                    };
                     apply_command(&core, &mut coordinator, cmd).await;
                     if coordinator.should_flush(
                         core.flush_request
@@ -389,6 +399,9 @@ fn run_loop(
                     .await;
                     match wake {
                         Wake::Command(Ok(cmd)) => {
+                            let Some(cmd) = defer_if_paused(&core, &mut deferred, cmd) else {
+                                continue;
+                            };
                             apply_command(&core, &mut coordinator, cmd).await;
                             if coordinator.should_flush(
                                 core.flush_request
@@ -768,6 +781,45 @@ async fn drain_and_finish(
     // io_uring backend, an in-flight kernel op) outlives the store lifecycle.
     core.cache.drain_parked_loads().await;
     core.state.finish_close();
+}
+
+/// Re-checks the maintenance pause immediately before a dequeued command would
+/// be dispatched. Returns `None` (the command is held for resume, at the back of
+/// `deferred`) if the pause is in force, `Some(cmd)` to apply it now.
+///
+/// The loop-top phase check alone is *not* sufficient: the idle park races
+/// `commands.recv()` against the state-change listener with `future::or`, which
+/// polls the `recv` arm **first** — so the very notify that announces the pause
+/// can hand this thread a command enqueued after it (legally: `with_intake`
+/// treats `Maintenance` as `Open`, because a permit taken before the pause is
+/// enqueue-allowed). `try_recv` has the same window between the loop-top read
+/// and the receive. Deferring keeps FIFO: everything already in `deferred` was
+/// admitted earlier than a command only now arriving from the channel.
+///
+/// **What this check does and does not prove.** `StoreInner::enqueue` sends
+/// under the phase lock (`EngineState::with_intake`) and
+/// `EngineState::enter_maintenance` flips the phase under that same lock, so a
+/// command enqueued while paused is never observed here alongside a stale
+/// `Running` read of *that* transition — the pause the sender saw is the pause
+/// this read sees. It is a *sampled* check, not an atomic check-and-dispatch:
+/// nothing is held across the `apply_command().await` that follows, so a pause
+/// entered after this read returns `Running` does not stop the command it just
+/// released. That residue is inherent to `begin_maintenance` today — it flips an
+/// enum and returns without any writer acknowledgement, so a command already
+/// dispatched (or a flush already running) can still complete after it returns.
+/// Closing this properly needs a writer-ack handshake, which is deliberately not
+/// part of this fix; what is fixed here is the reverse and much wider window —
+/// applying a command the writer received *after* it could see the pause.
+fn defer_if_paused(
+    core: &Arc<Core>,
+    deferred: &mut std::collections::VecDeque<Command>,
+    cmd: Command,
+) -> Option<Command> {
+    if core.state.phase() == Lifecycle::Maintenance {
+        deferred.push_back(cmd);
+        return None;
+    }
+    Some(cmd)
 }
 
 /// Fails every command a maintenance pause deferred, with the store's terminal

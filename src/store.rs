@@ -885,7 +885,12 @@ impl<B: Backend> Store<B> {
 
     /// Enters maintenance: the writer parks between commands and fresh admission
     /// fails fast with `Compacting`. Already-queued reservations stay charged.
-    /// Returns `false` if the store is not `Running`. Note [`Store::compact`] and
+    /// Returns `false` if the store is not `Running`.
+    ///
+    /// This flips the phase and returns; it does **not** wait for a writer
+    /// acknowledgement. No command the writer receives after the flip is applied
+    /// (`writer::defer_if_paused`), but one already dispatched — or a flush
+    /// already running — can still complete after this returns. Note [`Store::compact`] and
     /// [`Store::checkpoint`] do **not** use this — they run as writer commands;
     /// this is the operator-controlled pause (e.g. for external backup).
     ///

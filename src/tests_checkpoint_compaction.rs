@@ -3170,8 +3170,15 @@ fn the_data_space_metric_tracks_direct_writes_and_compaction() {
     );
 
     churn_direct(&map, 3);
-    // A compaction runs at a flushed barrier, so it is also the barrier this
-    // metric reads after: force the writer to flush by compacting below.
+    // `apply` resolves at *publication*, so the churn above leaves the flush
+    // running behind it: read the metric now and it reports however far the
+    // writer's background flushes happened to get (observed anywhere from one
+    // page to the full tail). Flush the visible version first — the metric moves
+    // at a flush, so this is the only point where it means "the whole churn".
+    // Without it the pre-compaction value can be *below* the post-compaction
+    // dense size and the shrink assertion below fails for a bookkeeping reason.
+    let churned = map.snapshot().version();
+    block_on(map.flush(churned)).unwrap();
     let grown = map.store().metrics().data_physical_bytes;
     assert!(
         grown > empty,
@@ -3183,6 +3190,9 @@ fn the_data_space_metric_tracks_direct_writes_and_compaction() {
 
     // A compaction shrinks it, and the metric must follow the cutover down.
     let report = block_on(map.store().compact()).unwrap();
+    // The metric and the size the compaction itself measured must agree on both
+    // ends of the cutover, not just after it.
+    assert_eq!(report.data_bytes_before, grown);
     assert_eq!(
         map.store().metrics().data_physical_bytes,
         report.data_bytes_after
