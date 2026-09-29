@@ -229,12 +229,18 @@ impl DirectHeader {
                 return Err(OpenError::Corrupt("non-empty root with zero entry count"));
             }
         }
+        let header_txid = rd_u64(hdr::OFF_HEADER_TXID);
+        if header_txid >= crate::wal::MAX_TXID {
+            return Err(OpenError::Corrupt(
+                "direct header txid at the exhaustion bound",
+            ));
+        }
         Ok(DirectHeader {
             store_uuid,
             root,
             logical_tail,
             entry_count,
-            header_txid: rd_u64(hdr::OFF_HEADER_TXID),
+            header_txid,
             id_delta,
         })
     }
@@ -1213,6 +1219,84 @@ fn rebuild_subtree<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_header_rejects_exhausted_txid_and_preserves_slot_fallback() {
+        use crate::backend::Direct;
+        use crate::io::FakeIo;
+        use crate::store::{Options, Store};
+        use futures_lite::future::block_on;
+
+        let fake = Arc::new(FakeIo::new(0));
+        let store = Store::<Direct>::create_with_io(
+            Arc::clone(&fake) as Arc<dyn PageIo>,
+            Options::default(),
+        )
+        .unwrap();
+        block_on(store.close()).unwrap();
+        let base = fake.snapshot_bytes();
+        let valid = DirectHeader::decode(&base[..PAGE_SIZE]).unwrap();
+        let mut boundary = valid;
+        boundary.header_txid = crate::wal::MAX_TXID - 1;
+        assert_eq!(
+            DirectHeader::decode(&boundary.encode())
+                .unwrap()
+                .header_txid,
+            crate::wal::MAX_TXID - 1
+        );
+        let mut boundary_bytes = base.clone();
+        let boundary_image = boundary.encode();
+        boundary_bytes[..PAGE_SIZE].copy_from_slice(&boundary_image);
+        boundary_bytes[PAGE_SIZE..2 * PAGE_SIZE].copy_from_slice(&boundary_image);
+        let fake = Arc::new(FakeIo::from_vec(boundary_bytes));
+        let store =
+            Store::<Direct>::open_over(Arc::clone(&fake) as Arc<dyn PageIo>, Options::default())
+                .unwrap();
+        let map = crate::map::BTreeMap::over(store);
+        assert_eq!(map.len(), 0);
+        block_on(map.verify()).unwrap();
+        let write = block_on(
+            map.apply(crate::batch::WriteBatch::new().insert(b"k".to_vec(), b"v".to_vec())),
+        );
+        assert!(matches!(write, Err(crate::error::WriteError::StoreFull)));
+        block_on(map.close()).unwrap();
+        for txid in [crate::wal::MAX_TXID, crate::wal::MAX_TXID + 1, u64::MAX] {
+            let mut invalid = valid;
+            invalid.header_txid = txid;
+            let image = invalid.encode();
+            assert!(matches!(
+                DirectHeader::decode(&image),
+                Err(OpenError::Corrupt(_))
+            ));
+            for slot in 0..2 {
+                let mut bytes = base.clone();
+                bytes[slot * PAGE_SIZE..(slot + 1) * PAGE_SIZE].copy_from_slice(&image);
+                let (winner, _) = pick_winning_header(
+                    Ok(&bytes[..PAGE_SIZE]),
+                    Ok(&bytes[PAGE_SIZE..2 * PAGE_SIZE]),
+                )
+                .unwrap();
+                assert_eq!(winner.header_txid, valid.header_txid);
+            }
+            let mut bytes = base.clone();
+            bytes[..PAGE_SIZE].copy_from_slice(&image);
+            bytes[PAGE_SIZE..2 * PAGE_SIZE].copy_from_slice(&image);
+            let fake = Arc::new(FakeIo::from_vec(bytes.clone()));
+            let opened = Store::<Direct>::open_over(
+                Arc::clone(&fake) as Arc<dyn PageIo>,
+                Options::default(),
+            );
+            if let Ok(store) = &opened {
+                block_on(store.close()).unwrap();
+            }
+            assert!(matches!(opened, Err(OpenError::Corrupt(_))));
+            assert_eq!(
+                fake.snapshot_bytes(),
+                bytes,
+                "invalid txid refusal must not mutate data"
+            );
+        }
+    }
 
     /// The rebuild's reachable-twice guard gets its own crafted-DAG probe.
     /// A checksum-valid branch naming one leaf twice must abort the rebuild as
