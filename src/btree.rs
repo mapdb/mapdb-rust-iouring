@@ -112,7 +112,8 @@ pub(crate) async fn apply_batch(
     let mut sorted: Vec<&Op> = ops.iter().collect();
     sorted.sort_by(|a, b| a.key().cmp(b.key()));
     let mut root = base_root;
-    let mut count = base_count as i64;
+    // Preserve the complete persisted u64 domain while applying signed deltas.
+    let mut count = i128::from(base_count);
     if root.is_empty() {
         // Empty-tree base case: apply every op to an empty entry vec (removes
         // are no-ops) and build whatever remains.
@@ -123,7 +124,7 @@ pub(crate) async fn apply_batch(
             if changed {
                 append &= ap;
             }
-            count += delta;
+            count += i128::from(delta);
         }
         if !entries.is_empty() {
             let ns = b.chunk_leaf(&entries, append);
@@ -131,21 +132,28 @@ pub(crate) async fn apply_batch(
         }
     } else {
         let (res, delta) = b.ops_node(root, &sorted, 0).await?;
-        count += delta;
+        count += i128::from(delta);
         if let NodeResult::Changed(ns) = res {
             root = b.build_up(ns.children, ns.seps);
         }
     }
-    if count <= 0 {
-        // The tree emptied: canonical empty representation is EMPTY, not an
-        // empty-leaf root. Any pages just built are dropped as garbage.
+    let count = u64::try_from(count)
+        .map_err(|_| ReadError::Corrupt("entry count arithmetic out of range"))?;
+    if count == 0 {
+        // A recovered count is not proof that the tree emptied. Check the
+        // final overlay-aware tree before dropping its reachable pages; a
+        // small forged count must never erase untouched surviving entries.
+        if b.has_entries(root).await? {
+            return Err(ReadError::Corrupt(
+                "entry count reached zero with surviving entries",
+            ));
+        }
         root = PageRef::EMPTY;
-        count = 0;
     }
     let pages = b.collect_reachable(root);
     Ok(BuiltBatch {
         root,
-        entry_count: count as u64,
+        entry_count: count,
         pages,
     })
 }
@@ -592,6 +600,43 @@ impl<'a> Builder<'a> {
         Ok(true)
     }
 
+    /// Proves emptiness only for a candidate zero-count collapse. The normal
+    /// positive-count write path does not scan untouched subtrees.
+    async fn has_entries(&mut self, root: PageRef) -> Result<bool, ReadError> {
+        if root.is_empty() {
+            return Ok(false);
+        }
+        let mut stack = vec![(root, 0)];
+        let mut seen = HashSet::new();
+        while let Some((reference, depth)) = stack.pop() {
+            if depth >= MAX_TREE_DEPTH || !seen.insert(reference.page_id) {
+                return Err(ReadError::Corrupt(
+                    "empty-tree check found a cycle or excessive depth",
+                ));
+            }
+            let page = self.get_node(reference).await?;
+            match page.kind() {
+                PageKind::Leaf => {
+                    if page.leaf_entries().next().is_some() {
+                        return Ok(true);
+                    }
+                }
+                PageKind::Branch => stack.extend(
+                    page.branch_children()
+                        .iter()
+                        .copied()
+                        .map(|child| (child, depth + 1)),
+                ),
+                PageKind::Overflow => {
+                    return Err(ReadError::Corrupt(
+                        "empty-tree check reached an overflow page",
+                    ))
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Collects every page reachable from `root` that lives in the overlay
     /// (i.e. was built this batch). Pre-existing pages stop the walk.
     ///
@@ -650,6 +695,124 @@ mod tests {
     use crate::io::FakeIo;
     use crate::page::{encode_overflow, Checksum};
     use futures_lite::future::block_on;
+
+    #[test]
+    fn corrupt_counts_cannot_discard_surviving_entries() {
+        block_on(async {
+            for (count, ops) in [
+                (
+                    i64::MAX as u64 + 1,
+                    vec![Op::Insert {
+                        key: b"a".to_vec(),
+                        value: b"new".to_vec(),
+                    }],
+                ),
+                (
+                    u64::MAX,
+                    vec![Op::Insert {
+                        key: b"a".to_vec(),
+                        value: b"new".to_vec(),
+                    }],
+                ),
+            ] {
+                let built = crate::read::TreeBuilder::default()
+                    .build(
+                        Arc::new(FakeIo::new(0)),
+                        &[
+                            (b"a".to_vec(), b"1".to_vec()),
+                            (b"b".to_vec(), b"2".to_vec()),
+                        ],
+                    )
+                    .unwrap();
+                let cache = PageCache::new();
+                let mut alloc = Allocator::for_wal(1000);
+                let batch =
+                    apply_batch(&cache, &built.file, built.root, count, &ops, &mut alloc, 1)
+                        .await
+                        .unwrap();
+                assert!(
+                    !batch.root.is_empty(),
+                    "u64 count must not narrow into an empty-tree decision"
+                );
+                assert_eq!(batch.entry_count, count);
+            }
+            for (count, ops) in [
+                (1, vec![Op::Remove { key: b"a".to_vec() }]),
+                (0, vec![Op::Remove { key: b"a".to_vec() }]),
+                (
+                    0,
+                    vec![Op::Insert {
+                        key: b"a".to_vec(),
+                        value: b"new".to_vec(),
+                    }],
+                ),
+                (
+                    u64::MAX,
+                    vec![Op::Insert {
+                        key: b"c".to_vec(),
+                        value: b"new".to_vec(),
+                    }],
+                ),
+            ] {
+                let built = crate::read::TreeBuilder::default()
+                    .build(
+                        Arc::new(FakeIo::new(0)),
+                        &[
+                            (b"a".to_vec(), b"1".to_vec()),
+                            (b"b".to_vec(), b"2".to_vec()),
+                        ],
+                    )
+                    .unwrap();
+                let cache = PageCache::new();
+                let mut alloc = Allocator::for_wal(1000);
+                assert!(matches!(
+                    apply_batch(&cache, &built.file, built.root, count, &ops, &mut alloc, 1).await,
+                    Err(ReadError::Corrupt(_))
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn empty_collapse_checks_overlay_and_untouched_siblings() {
+        block_on(async {
+            let entries: Vec<_> = (0..32u8).map(|key| (vec![key], vec![key])).collect();
+            let builder = crate::read::TreeBuilder {
+                max_fanout: 4,
+                max_leaf_entries: 2,
+                ..Default::default()
+            };
+            let built = builder.build(Arc::new(FakeIo::new(0)), &entries).unwrap();
+            let cache = PageCache::new();
+            let mut alloc = Allocator::for_wal(1000);
+            let result = apply_batch(
+                &cache,
+                &built.file,
+                built.root,
+                1,
+                &[Op::Remove { key: vec![0] }],
+                &mut alloc,
+                1,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(ReadError::Corrupt(
+                    "entry count reached zero with surviving entries"
+                ))
+            ));
+            let deletes: Vec<_> = entries
+                .iter()
+                .map(|(key, _)| Op::Remove { key: key.clone() })
+                .collect();
+            let empty = apply_batch(&cache, &built.file, built.root, 32, &deletes, &mut alloc, 2)
+                .await
+                .unwrap();
+            assert!(empty.root.is_empty());
+            assert_eq!(empty.entry_count, 0);
+            assert!(empty.pages.is_empty());
+        });
+    }
 
     /// The builder's overlay must re-derive trust from the ref, exactly as the
     /// cache does.

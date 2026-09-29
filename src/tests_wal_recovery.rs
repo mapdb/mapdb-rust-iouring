@@ -1102,3 +1102,115 @@ fn explicit_verify_detects_recovered_wal_count_mismatch() {
         block_on(recovered.close()).unwrap();
     }
 }
+
+fn five_entry_count_fixture() -> (Vec<u8>, Vec<u8>) {
+    let (data, wal) = devices();
+    let map = BTreeMap::over(create(&data, &wal, opts()));
+    block_on(async {
+        let batch = (0..5u8).fold(WriteBatch::new(), |batch, key| {
+            batch.insert(vec![key], vec![key])
+        });
+        let ApplyOutcome::Applied { version, .. } = map.apply(batch).await.unwrap() else {
+            panic!("expected apply");
+        };
+        map.commit(version).await.unwrap();
+        map.close().await.unwrap();
+    });
+    (data.synced_bytes(), wal.synced_bytes())
+}
+
+fn single_record_with_count(mut image: Vec<u8>, count: u64) -> Vec<u8> {
+    let start = crate::page::PAGE_SIZE;
+    let end = image.len();
+    let record_len = u64::from_le_bytes(image[end - 12..end - 4].try_into().unwrap()) as usize;
+    assert_eq!(
+        record_len,
+        end - start,
+        "fixture must contain exactly one committed record"
+    );
+    let tail = end - 52;
+    image[tail + 20..tail + 28].copy_from_slice(&count.to_le_bytes());
+    let previous = u32::from_le_bytes(image[start + 24..start + 28].try_into().unwrap());
+    let checksum = crc32c::crc32c_append(previous, &image[start..tail + 28]);
+    image[tail + 28..tail + 32].copy_from_slice(&checksum.to_le_bytes());
+    image[end - 4..].copy_from_slice(&checksum.to_le_bytes());
+    image
+}
+
+#[test]
+fn recovered_wal_large_count_update_preserves_entries() {
+    let (data, wal) = five_entry_count_fixture();
+    for count in [i64::MAX as u64 + 1, u64::MAX] {
+        let (store, data_dev, wal_dev) = open_over_devs(
+            data.clone(),
+            single_record_with_count(wal.clone(), count),
+            opts(),
+        )
+        .unwrap();
+        let map = BTreeMap::over(store);
+        block_on(async {
+            let ApplyOutcome::Applied { version, .. } = map
+                .apply(WriteBatch::new().insert(vec![0], vec![9]))
+                .await
+                .unwrap()
+            else {
+                panic!("expected apply");
+            };
+            map.commit(version).await.unwrap();
+            assert_eq!(map.len(), count);
+            for key in 0..5u8 {
+                assert_eq!(
+                    map.get(vec![key]).await.unwrap(),
+                    Some(vec![if key == 0 { 9 } else { key }])
+                );
+            }
+            map.close().await.unwrap();
+        });
+        let reopened = BTreeMap::over(reopen_synced(&data_dev, &wal_dev, opts()).unwrap());
+        assert_eq!(reopened.len(), count);
+        for key in 0..5u8 {
+            assert_eq!(
+                block_on(reopened.get(vec![key])).unwrap(),
+                Some(vec![if key == 0 { 9 } else { key }])
+            );
+        }
+        block_on(reopened.close()).unwrap();
+    }
+}
+
+#[test]
+fn recovered_wal_count_collapse_refusal_preserves_durable_bytes() {
+    let (data, wal) = five_entry_count_fixture();
+    for (count, batch) in [
+        (1, WriteBatch::new().remove(vec![0])),
+        (u64::MAX, WriteBatch::new().insert(vec![99], vec![99])),
+    ] {
+        let (store, data_dev, wal_dev) = open_over_devs(
+            data.clone(),
+            single_record_with_count(wal.clone(), count),
+            opts(),
+        )
+        .unwrap();
+        let map = BTreeMap::over(store);
+        let before = (data_dev.snapshot_bytes(), wal_dev.snapshot_bytes());
+        let result = block_on(map.apply(batch));
+        assert!(
+            matches!(
+                result,
+                Err(WriteError::Poisoned(crate::error::PoisonReason::Corrupt(_)))
+            ),
+            "expected count-corruption refusal, got {result:?}"
+        );
+        assert_eq!(
+            before,
+            (data_dev.snapshot_bytes(), wal_dev.snapshot_bytes())
+        );
+        let _ = block_on(map.close()); // already poisoned; drain lifecycle without claiming a clean close
+        let recovered =
+            BTreeMap::over(reopen_wal_image(&data_dev, wal_dev.snapshot_bytes(), opts()).unwrap());
+        for key in 0..5u8 {
+            assert_eq!(block_on(recovered.get(vec![key])).unwrap(), Some(vec![key]));
+        }
+        block_on(recovered.close()).unwrap();
+    }
+}

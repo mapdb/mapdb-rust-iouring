@@ -1210,3 +1210,60 @@ fn explicit_verify_uses_count_from_captured_map_root() {
         map.close().await.unwrap();
     });
 }
+
+#[test]
+fn fast_open_count_collapse_refusal_preserves_direct_bytes() {
+    for (count, batch) in [
+        (1, WriteBatch::new().remove(vec![0])),
+        (u64::MAX, WriteBatch::new().insert(vec![99], vec![99])),
+    ] {
+        let dev = Arc::new(FakeIo::new(0));
+        let map = direct_map(Arc::clone(&dev));
+        block_on(async {
+            let batch = (0..5u8).fold(WriteBatch::new(), |batch, key| {
+                batch.insert(vec![key], vec![key])
+            });
+            map.apply(batch).await.unwrap();
+            map.close().await.unwrap();
+            let bytes = dev.snapshot_bytes();
+            let pg = crate::page::PAGE_SIZE;
+            let a = DirectHeader::decode(&bytes[..pg]);
+            let b = DirectHeader::decode(&bytes[pg..2 * pg]);
+            let (mut header, offset) = match (a, b) {
+                (Ok(a), Ok(b)) if b.header_txid > a.header_txid => (b, pg as u64),
+                (Ok(a), _) => (a, 0),
+                (Err(_), Ok(b)) => (b, pg as u64),
+                _ => panic!("no valid header"),
+            };
+            header.entry_count = count;
+            dev.write_all_at(offset, header.encode())
+                .await
+                .result
+                .unwrap();
+        });
+        let options = Options {
+            verify_tree_on_open: false,
+            ..Options::default()
+        };
+        let map = BTreeMap::over(
+            Store::<crate::Direct>::open_over(as_dev(&dev), options.clone()).unwrap(),
+        );
+        let before = dev.snapshot_bytes();
+        let result = block_on(map.apply(batch));
+        assert!(
+            matches!(
+                result,
+                Err(WriteError::Poisoned(crate::error::PoisonReason::Corrupt(_)))
+            ),
+            "expected count refusal, got {result:?}"
+        );
+        assert_eq!(before, dev.snapshot_bytes());
+        let _ = block_on(map.close());
+        let recovered =
+            BTreeMap::over(Store::<crate::Direct>::open_over(as_dev(&dev), options).unwrap());
+        for key in 0..5u8 {
+            assert_eq!(block_on(recovered.get(vec![key])).unwrap(), Some(vec![key]));
+        }
+        block_on(recovered.close()).unwrap();
+    }
+}
