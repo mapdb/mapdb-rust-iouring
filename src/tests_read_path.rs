@@ -185,3 +185,19 @@ proptest! {
         })?;
     }
 }
+
+#[test]
+fn map_verify_rejects_descriptor_count_mismatch() {
+    for count in [0, 1, 999, u64::MAX] {
+        let mut built = TreeBuilder::default()
+            .build(Arc::new(FakeIo::new(0)), &kvs(5))
+            .unwrap();
+        built.entry_count = count;
+        let store = Store::<crate::Direct>::open_readonly_tree(built, Options::default());
+        let map = BTreeMap::over(store);
+        assert!(matches!(
+            block_on(map.verify()),
+            Err(crate::error::ReadError::Corrupt(_))
+        ));
+    }
+}

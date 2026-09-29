@@ -283,7 +283,8 @@ impl<B: Backend> BTreeMap<B> {
         let terminal = self.store.inner.core.state.check_terminal();
         async move {
             terminal?;
-            crate::read::tree_verify(&cache, &root.file, root.root).await
+            crate::read::tree_verify_with_count(&cache, &root.file, root.root, root.entry_count)
+                .await
         }
     }
 

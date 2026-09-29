@@ -1388,6 +1388,20 @@ pub(crate) async fn tree_verify(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Verifies structure and the entry count recorded with that exact root.
+pub(crate) async fn tree_verify_with_count(
+    cache: &PageCache,
+    file: &FileGeneration,
+    root: PageRef,
+    expected_count: u64,
+) -> Result<VerifyReport, ReadError> {
+    let report = tree_verify(cache, file, root).await?;
+    if report.entry_count != expected_count {
+        return Err(ReadError::Corrupt("root entry count disagrees with tree"));
+    }
+    Ok(report)
+}
+
 fn verify_node<'a>(
     cache: &'a PageCache,
     file: &'a FileGeneration,
@@ -1828,11 +1842,11 @@ impl TreeReader {
         }
     }
 
-    /// Structural verify of the current generation.
+    /// Verifies structure and the entry count of the captured generation.
     pub fn verify(&self) -> impl Future<Output = Result<VerifyReport, ReadError>> + Send {
         let cache = Arc::clone(&self.cache);
         let state = self.state.load_full();
-        async move { tree_verify(&cache, &state.file, state.root).await }
+        async move { tree_verify_with_count(&cache, &state.file, state.root, state.entry_count).await }
     }
 
     /// Entries in the current generation.
@@ -1963,6 +1977,47 @@ mod tests {
             max_leaf_entries: 8,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn public_verify_rejects_descriptor_count_mismatch() {
+        for count in [0, 1, 999, u64::MAX] {
+            let mut built = multilevel()
+                .build(Arc::new(FakeIo::new(0)), &entries(5))
+                .unwrap();
+            built.entry_count = count;
+            let reader = TreeReader::new(built);
+            assert!(matches!(
+                block_on(reader.verify()),
+                Err(ReadError::Corrupt(_))
+            ));
+        }
+        let mut empty = multilevel().build(Arc::new(FakeIo::new(0)), &[]).unwrap();
+        empty.entry_count = 1;
+        assert!(matches!(
+            block_on(TreeReader::new(empty).verify()),
+            Err(ReadError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn public_verify_uses_count_from_captured_generation() {
+        let built = multilevel()
+            .build(Arc::new(FakeIo::new(0)), &entries(5))
+            .unwrap();
+        let reader = TreeReader::new(built);
+        let verify = reader.verify();
+        let next_builder = TreeBuilder {
+            first_page_id: 1000,
+            ..multilevel()
+        };
+        reader.cutover(
+            next_builder
+                .build(Arc::new(FakeIo::new(0)), &entries(9))
+                .unwrap(),
+        );
+        assert_eq!(block_on(verify).unwrap().entry_count, 5);
+        assert_eq!(block_on(reader.verify()).unwrap().entry_count, 9);
     }
 
     #[test]

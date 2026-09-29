@@ -1145,3 +1145,68 @@ fn a_zero_page_flush_still_advances_the_durable_frontier() {
     );
     block_on(map.close()).unwrap();
 }
+
+#[test]
+fn explicit_verify_rejects_count_after_fast_header_only_open() {
+    for count in [1, 999, u64::MAX] {
+        let dev = Arc::new(FakeIo::new(0));
+        let map = direct_map(Arc::clone(&dev));
+        block_on(async {
+            for key in 0..5u8 {
+                map.apply(WriteBatch::new().insert(vec![key], vec![key]))
+                    .await
+                    .unwrap();
+            }
+            map.close().await.unwrap();
+            let bytes = dev.snapshot_bytes();
+            let pg = crate::page::PAGE_SIZE;
+            let a = DirectHeader::decode(&bytes[..pg]);
+            let b = DirectHeader::decode(&bytes[pg..2 * pg]);
+            let (mut header, offset) = match (a, b) {
+                (Ok(a), Ok(b)) if b.header_txid > a.header_txid => (b, pg as u64),
+                (Ok(a), _) => (a, 0),
+                (Err(_), Ok(b)) => (b, pg as u64),
+                _ => panic!("no valid header"),
+            };
+            header.entry_count = count;
+            dev.write_all_at(offset, header.encode())
+                .await
+                .result
+                .unwrap();
+        });
+        let options = Options {
+            verify_tree_on_open: false,
+            ..Options::default()
+        };
+        let map = BTreeMap::over(Store::<crate::Direct>::open_over(as_dev(&dev), options).unwrap());
+        let before = dev.snapshot_bytes();
+        assert!(matches!(
+            block_on(map.verify()),
+            Err(crate::error::ReadError::Corrupt(_))
+        ));
+        assert_eq!(
+            before,
+            dev.snapshot_bytes(),
+            "integrity verification must not write"
+        );
+        block_on(map.close()).unwrap();
+    }
+}
+
+#[test]
+fn explicit_verify_uses_count_from_captured_map_root() {
+    let dev = Arc::new(FakeIo::new(0));
+    let map = direct_map(dev);
+    block_on(async {
+        map.apply(WriteBatch::new().insert(b"a".to_vec(), b"v".to_vec()))
+            .await
+            .unwrap();
+        let verify = map.verify();
+        map.apply(WriteBatch::new().insert(b"b".to_vec(), b"v".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(verify.await.unwrap().entry_count, 1);
+        assert_eq!(map.verify().await.unwrap().entry_count, 2);
+        map.close().await.unwrap();
+    });
+}

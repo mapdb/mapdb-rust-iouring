@@ -1052,3 +1052,53 @@ fn empty_wal_recovers_empty_store() {
     assert_eq!(map.len(), 0);
     assert!(map.is_empty());
 }
+
+#[test]
+fn explicit_verify_detects_recovered_wal_count_mismatch() {
+    let (data, wal) = devices();
+    let map = BTreeMap::over(create(&data, &wal, opts()));
+    block_on(async {
+        let mut batch = WriteBatch::new();
+        for key in 0..5u8 {
+            batch = batch.insert(vec![key], vec![key]);
+        }
+        let ApplyOutcome::Applied { version, .. } = map.apply(batch).await.unwrap() else {
+            panic!("expected apply");
+        };
+        map.commit(version).await.unwrap();
+        map.close().await.unwrap();
+    });
+    let original = wal.synced_bytes();
+    for count in [1u64, 999, u64::MAX] {
+        let mut image = original.clone();
+        let start = crate::page::PAGE_SIZE;
+        let tail = image.len() - 52;
+        image[tail + 20..tail + 28].copy_from_slice(&count.to_le_bytes());
+        let previous = u32::from_le_bytes(image[start + 24..start + 28].try_into().unwrap());
+        let checksum = crc32c::crc32c_append(previous, &image[start..tail + 28]);
+        image[tail + 28..tail + 32].copy_from_slice(&checksum.to_le_bytes());
+        let end = image.len();
+        image[end - 4..].copy_from_slice(&checksum.to_le_bytes());
+        let (store, data_image, wal_image) =
+            open_over_devs(data.synced_bytes(), image, opts()).unwrap();
+        let recovered = BTreeMap::over(store);
+        assert_eq!(
+            recovered.len(),
+            count,
+            "fixture must retain its checksum-valid declaration"
+        );
+        for key in 0..5u8 {
+            assert_eq!(block_on(recovered.get(vec![key])).unwrap(), Some(vec![key]));
+        }
+        let before = (data_image.snapshot_bytes(), wal_image.snapshot_bytes());
+        assert!(matches!(
+            block_on(recovered.verify()),
+            Err(crate::error::ReadError::Corrupt(_))
+        ));
+        assert_eq!(
+            before,
+            (data_image.snapshot_bytes(), wal_image.snapshot_bytes())
+        );
+        block_on(recovered.close()).unwrap();
+    }
+}
