@@ -1119,7 +1119,7 @@ fn five_entry_count_fixture() -> (Vec<u8>, Vec<u8>) {
     (data.synced_bytes(), wal.synced_bytes())
 }
 
-fn single_record_with_count(mut image: Vec<u8>, count: u64) -> Vec<u8> {
+fn single_record_with_count(image: Vec<u8>, count: u64) -> Vec<u8> {
     let start = crate::page::PAGE_SIZE;
     let end = image.len();
     let record_len = u64::from_le_bytes(image[end - 12..end - 4].try_into().unwrap()) as usize;
@@ -1128,6 +1128,14 @@ fn single_record_with_count(mut image: Vec<u8>, count: u64) -> Vec<u8> {
         end - start,
         "fixture must contain exactly one committed record"
     );
+    last_record_with_count(image, count)
+}
+
+fn last_record_with_count(mut image: Vec<u8>, count: u64) -> Vec<u8> {
+    let end = image.len();
+    let record_len = u64::from_le_bytes(image[end - 12..end - 4].try_into().unwrap()) as usize;
+    let start = end.checked_sub(record_len).unwrap();
+    assert!(start >= crate::page::PAGE_SIZE);
     let tail = end - 52;
     image[tail + 20..tail + 28].copy_from_slice(&count.to_le_bytes());
     let previous = u32::from_le_bytes(image[start + 24..start + 28].try_into().unwrap());
@@ -1213,4 +1221,69 @@ fn recovered_wal_count_collapse_refusal_preserves_durable_bytes() {
         }
         block_on(recovered.close()).unwrap();
     }
+}
+
+// A zero count is structurally invalid for a nonempty root. Recovery stops at
+// the previous accepted record; this is distinct from a positive wrong count
+// that remains readable and is caught by explicit integrity verification.
+#[test]
+fn recovered_wal_zero_count_stops_at_prefix_and_later_write_preserves_it() {
+    let (data, first_wal) = five_entry_count_fixture();
+    let (store, data_dev, wal_dev) = open_over_devs(data, first_wal.clone(), opts()).unwrap();
+    let map = BTreeMap::over(store);
+    put(&map, &[5], &[5]);
+    block_on(map.close()).unwrap();
+    let data = data_dev.synced_bytes();
+    let complete_wal = wal_dev.synced_bytes();
+    let record_len = u64::from_le_bytes(
+        complete_wal[complete_wal.len() - 12..complete_wal.len() - 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(complete_wal.len() - record_len, first_wal.len());
+    assert_eq!(&complete_wal[..first_wal.len()], first_wal.as_slice());
+    let forged = last_record_with_count(complete_wal.clone(), 0);
+    assert_eq!(&forged[..first_wal.len()], first_wal.as_slice());
+
+    // Control: the same second record with its correct count recovers six.
+    let control = BTreeMap::over(
+        open_over_devs(data.clone(), complete_wal, opts())
+            .unwrap()
+            .0,
+    );
+    assert_eq!(control.len(), 6);
+    assert_eq!(block_on(control.get(vec![5])).unwrap(), Some(vec![5]));
+    block_on(control.close()).unwrap();
+
+    for _ in 0..2 {
+        let (store, d, w) = open_over_devs(data.clone(), forged.clone(), opts()).unwrap();
+        let recovered = BTreeMap::over(store);
+        assert_eq!(recovered.len(), 5);
+        for key in 0..5u8 {
+            assert_eq!(block_on(recovered.get(vec![key])).unwrap(), Some(vec![key]));
+        }
+        assert_eq!(block_on(recovered.get(vec![5])).unwrap(), None);
+        block_on(recovered.verify()).unwrap();
+        assert_eq!(d.snapshot_bytes(), data);
+        assert_eq!(w.snapshot_bytes(), forged);
+        block_on(recovered.close()).unwrap();
+        assert_eq!(d.snapshot_bytes(), data);
+        assert_eq!(w.snapshot_bytes(), forged);
+    }
+
+    let (store, d, w) = open_over_devs(data, forged, opts()).unwrap();
+    let recovered = BTreeMap::over(store);
+    put(&recovered, &[0], &[9]);
+    block_on(recovered.close()).unwrap();
+    let rewritten = BTreeMap::over(reopen_synced(&d, &w, opts()).unwrap());
+    assert_eq!(rewritten.len(), 5);
+    for key in 0..5u8 {
+        assert_eq!(
+            block_on(rewritten.get(vec![key])).unwrap(),
+            Some(vec![if key == 0 { 9 } else { key }])
+        );
+    }
+    assert_eq!(block_on(rewritten.get(vec![5])).unwrap(), None);
+    block_on(rewritten.verify()).unwrap();
+    block_on(rewritten.close()).unwrap();
 }
