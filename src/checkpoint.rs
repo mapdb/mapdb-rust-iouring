@@ -160,6 +160,12 @@ impl CheckpointHeader {
         if rd_u32(off::MAGIC) != off::MAGIC_VALUE {
             return Err(OpenError::Corrupt("bad checkpoint header magic"));
         }
+        // Authenticate the format byte before treating it as a version claim:
+        // a torn slot must remain eligible for fallback to its intact sibling.
+        let stored_ck = rd_u32(off::HEADER_CKSUM);
+        if crc32c::crc32c(&bytes[..off::HEADER_CKSUM]) != stored_ck {
+            return Err(OpenError::Corrupt("checkpoint header checksum mismatch"));
+        }
         // A v1 base / v2 checkpoint header (older) or a future release's header
         // (newer) reaches here — refuse clearly, at open, before any mutation
         // (M6 Phase H forward policy).
@@ -171,10 +177,6 @@ impl CheckpointHeader {
         }
         if rd_u32(off::PAGE_SIZE) != PAGE_SIZE as u32 {
             return Err(OpenError::Corrupt("unsupported checkpoint page size"));
-        }
-        let stored_ck = rd_u32(off::HEADER_CKSUM);
-        if crc32c::crc32c(&bytes[..off::HEADER_CKSUM]) != stored_ck {
-            return Err(OpenError::Corrupt("checkpoint header checksum mismatch"));
         }
         let mut store_uuid = [0u8; 16];
         store_uuid.copy_from_slice(&bytes[off::STORE_UUID..off::STORE_UUID + 16]);
@@ -391,12 +393,18 @@ pub async fn read_manifest(
 /// higher `checkpoint_seq` among slots that fully decode. If both decode with the
 /// *same* seq but differ, that is corruption, not a coin-flip. If
 /// neither decodes, `Corrupt`. A torn just-written slot simply fails to decode and
-/// the prior slot wins — the crash-safe commit property.
+/// the prior slot wins — the crash-safe commit property. An authenticated
+/// unsupported format in either slot refuses open, irrespective of sequence.
 pub async fn read_winning_header(data: &dyn PageIo) -> Result<CheckpointHeader, OpenError> {
     let slot0 = data.read_exact_at(0, PAGE_SIZE).await?;
     let slot1 = data.read_exact_at(PAGE_SIZE as u64, PAGE_SIZE).await?;
-    let h0 = CheckpointHeader::decode(&slot0).ok();
-    let h1 = CheckpointHeader::decode(&slot1).ok();
+    let decode = |slot: &[u8]| match CheckpointHeader::decode(slot) {
+        Ok(header) => Ok(Some(header)),
+        Err(e @ OpenError::UnsupportedFormat { .. }) => Err(e),
+        Err(_) => Ok(None),
+    };
+    let h0 = decode(&slot0)?;
+    let h1 = decode(&slot1)?;
     match (h0, h1) {
         (None, None) => Err(OpenError::Corrupt("no valid checkpoint header slot")),
         (Some(h), None) | (None, Some(h)) => Ok(h),
@@ -426,9 +434,6 @@ pub async fn read_winning_header(data: &dyn PageIo) -> Result<CheckpointHeader, 
         }
     }
 }
-
-// Both `Result::ok` above intentionally discard the decode error; the winner is
-// chosen by seq, and "no valid slot" is reported once with its own message.
 
 #[cfg(test)]
 mod tests {
@@ -610,6 +615,65 @@ mod tests {
                 .unwrap();
             let w = read_winning_header(&dev).await.unwrap();
             assert_eq!(w.checkpoint_seq, 0, "torn newer slot → older slot wins");
+        });
+    }
+
+    #[test]
+    fn winning_header_checks_format_only_after_crc_and_refuses_either_slot() {
+        block_on(async {
+            for slot in 0..2 {
+                for format in [FORMAT_V3 - 1, FORMAT_V3 + 1] {
+                    for seq in [0, 3, 7] {
+                        let dev = FakeIo::new(2 * PAGE_SIZE);
+                        let mut valid = CheckpointHeader::fresh(uuid(), PAGE_SIZE as u64, 1);
+                        valid.checkpoint_seq = 3;
+                        for offset in [0, PAGE_SIZE as u64] {
+                            dev.write_all_at(offset, valid.encode())
+                                .await
+                                .result
+                                .unwrap();
+                        }
+                        let mut other = valid;
+                        other.checkpoint_seq = seq;
+                        let mut image = other.encode();
+                        image[off::FORMAT] = format;
+                        // An unsealed version byte is slot damage, not a refusal.
+                        dev.write_all_at((slot * PAGE_SIZE) as u64, image.clone())
+                            .await
+                            .result
+                            .unwrap();
+                        assert_eq!(read_winning_header(&dev).await.unwrap().checkpoint_seq, 3);
+                        let ck = crc32c::crc32c(&image[..off::HEADER_CKSUM]);
+                        image[off::HEADER_CKSUM..off::HEADER_CKSUM + 4]
+                            .copy_from_slice(&ck.to_le_bytes());
+                        dev.write_all_at((slot * PAGE_SIZE) as u64, image)
+                            .await
+                            .result
+                            .unwrap();
+                        assert!(matches!(read_winning_header(&dev).await,
+                            Err(OpenError::UnsupportedFormat { found, .. }) if found == format));
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn winning_header_rejects_conflicting_equal_sequences() {
+        block_on(async {
+            let dev = FakeIo::new(2 * PAGE_SIZE);
+            let a = CheckpointHeader::fresh(uuid(), PAGE_SIZE as u64, 1);
+            let mut b = a;
+            b.wal_chain_seed = 2;
+            dev.write_all_at(0, a.encode()).await.result.unwrap();
+            dev.write_all_at(PAGE_SIZE as u64, b.encode())
+                .await
+                .result
+                .unwrap();
+            assert!(matches!(
+                read_winning_header(&dev).await,
+                Err(OpenError::Corrupt(_))
+            ));
         });
     }
 

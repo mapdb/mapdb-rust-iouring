@@ -310,14 +310,15 @@ impl Store<Wal> {
             )));
         }
         let lock = acquire_lock(path)?;
-        // Active-path-wins: remove an orphaned compaction temp (M6 Phase D).
-        crate::compact::remove_stale_temp(path)?;
         let data: Arc<dyn PageIo> = factory.open_existing(path, FileRole::Data)?;
         // Read the winning header once here purely to name the segment; `open_over`
         // re-reads it under the lock as recovery's authority (both reads see the
         // same bytes — the file is not written until the writer starts).
         let header =
             futures_lite::future::block_on(crate::checkpoint::read_winning_header(&*data))?;
+        // Active-path-wins only after the format gate: a downgrade refusal must
+        // preserve even an orphaned compaction image (M6 Phase D).
+        crate::compact::remove_stale_temp(path)?;
         let wpath = segment_path(path, header.wal_segment_seq);
         if !wpath.exists() {
             return Err(OpenError::from(io::Error::new(
@@ -892,6 +893,57 @@ mod tests {
         block_on(opened.shutdown()).unwrap();
         fs.unlink_segment(7).unwrap();
         cleanup(&path);
+    }
+
+    #[test]
+    fn unsupported_checkpoint_refuses_without_namespace_mutation() {
+        use crate::checkpoint::{CheckpointHeader, FORMAT_V3};
+        use crate::page::PAGE_SIZE;
+        use std::collections::BTreeMap as FileImages;
+
+        for slot in 0..2 {
+            for format in [FORMAT_V3 - 1, FORMAT_V3 + 1] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("store");
+                let store = Store::<Wal>::create_path(&path, Options::default()).unwrap();
+                block_on(store.close()).unwrap();
+                let mut data = std::fs::read(&path).unwrap();
+                let mut header = CheckpointHeader::decode(&data[..PAGE_SIZE]).unwrap();
+                header.checkpoint_seq = 2;
+                header.wal_segment_seq = 2;
+                let mut image = header.encode();
+                image[4] = format;
+                let crc = crc32c::crc32c(&image[..124]);
+                image[124..128].copy_from_slice(&crc.to_le_bytes());
+                data[slot * PAGE_SIZE..(slot + 1) * PAGE_SIZE].copy_from_slice(&image);
+                std::fs::write(&path, data).unwrap();
+                std::fs::copy(segment_path(&path, 0), segment_path(&path, 2)).unwrap();
+                std::fs::write(crate::compact::temp_path(&path), b"preserve pending image")
+                    .unwrap();
+                let snapshot = || -> FileImages<_, _> {
+                    std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|entry| {
+                            let entry = entry.unwrap();
+                            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                        })
+                        .collect()
+                };
+                let before = snapshot();
+                let result = Store::<Wal>::open_path(&path, Options::default());
+                if let Ok(store) = &result {
+                    block_on(store.close()).unwrap();
+                }
+                assert!(
+                    matches!(result, Err(OpenError::UnsupportedFormat { found, .. }) if found == format)
+                );
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "refusal must preserve every file and byte"
+                );
+            }
+        }
     }
 
     #[test]
