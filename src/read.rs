@@ -1387,7 +1387,6 @@ pub(crate) async fn tree_verify(
     Ok(VerifyReport { entry_count: count })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Verifies structure and the entry count recorded with that exact root.
 pub(crate) async fn tree_verify_with_count(
     cache: &PageCache,
@@ -1402,6 +1401,7 @@ pub(crate) async fn tree_verify_with_count(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_node<'a>(
     cache: &'a PageCache,
     file: &'a FileGeneration,
