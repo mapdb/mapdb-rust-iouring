@@ -1062,13 +1062,22 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Every pre-existing file name and byte in `dir` (the lock sidecar included).
+    /// Every pre-existing file name and byte in `dir` (the lock sidecar
+    /// included). A symlink is recorded by its link text, never followed, so a
+    /// dangling one is snapshotted too.
     fn namespace_images(dir: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt;
         std::fs::read_dir(dir)
             .unwrap()
             .map(|entry| {
                 let entry = entry.unwrap();
-                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                let image = if entry.file_type().unwrap().is_symlink() {
+                    let target = std::fs::read_link(entry.path()).unwrap();
+                    [b"symlink:".as_slice(), target.as_os_str().as_bytes()].concat()
+                } else {
+                    std::fs::read(entry.path()).unwrap()
+                };
+                (entry.file_name(), image)
             })
             .collect()
     }
@@ -1188,17 +1197,57 @@ mod tests {
                 failures.push(msg);
             }
         }
+        // Identity defects named by the *data* header (chain seed, scan origin)
+        // refuse before cleanup too.
+        for field in ["chain seed", "scan origin"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = store_with_leftovers(dir.path());
+            let mut data = std::fs::read(&path).unwrap();
+            let page = crate::page::PAGE_SIZE;
+            let mut header = crate::checkpoint::CheckpointHeader::decode(&data[..page]).unwrap();
+            if field == "chain seed" {
+                header.wal_chain_seed ^= 1;
+            } else {
+                header.wal_scan_origin = u64::MAX / 2;
+            }
+            data[..page].copy_from_slice(&header.encode());
+            std::fs::write(&path, data).unwrap();
+            let before = namespace_images(dir.path());
+            let result = Store::<Wal>::open_path(&path, Options::default());
+            if let Ok(store) = &result {
+                block_on(store.close()).unwrap();
+            }
+            match result {
+                Err(OpenError::Corrupt(_)) => {}
+                other => failures.push(format!("{field}: wrong result {:?}", other.err())),
+            }
+            if let Err(panic) = std::panic::catch_unwind(|| {
+                assert_same_namespace(dir.path(), &before, field);
+            }) {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "namespace changed".into());
+                failures.push(msg);
+            }
+        }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// fable72 F3: a refused open of a store that has no lock sidecar (copied
-    /// without it, or pre-T1.5) must not create one. Covers both WAL open-time
-    /// version gates: the checkpoint (data) header and the segment header.
+    /// without it, or pre-T1.5) — or whose sidecar is a dangling symlink — must
+    /// not create one (nor the link's target). Covers both WAL open-time version
+    /// gates: the checkpoint (data) header and the segment header.
     #[test]
     fn refusal_without_sidecar_does_not_create_one() {
         use crate::checkpoint::FORMAT_V3;
         use crate::page::PAGE_SIZE;
-        for gate in ["data header", "WAL segment header"] {
+        for (gate, dangling) in [
+            ("data header", false),
+            ("WAL segment header", false),
+            ("data header", true),
+            ("WAL segment header", true),
+        ] {
             for slot in 0..2 {
                 let dir = tempfile::tempdir().unwrap();
                 let path = store_with_leftovers(dir.path());
@@ -1218,17 +1267,22 @@ mod tests {
                     continue;
                 }
                 std::fs::remove_file(lock_path(&path)).unwrap();
+                if dangling {
+                    std::os::unix::fs::symlink("lock-target", lock_path(&path)).unwrap();
+                }
                 let before = namespace_images(dir.path());
                 let result = Store::<Wal>::open_path(&path, Options::default());
                 if let Ok(store) = &result {
                     block_on(store.close()).unwrap();
                 }
+                let case = format!("{gate} slot {slot} dangling {dangling}");
                 assert!(
                     matches!(result, Err(OpenError::UnsupportedFormat { component, .. }) if component == gate),
-                    "{gate} slot {slot}: {:?}",
+                    "{case}: {:?}",
                     result.err()
                 );
-                assert_same_namespace(dir.path(), &before, &format!("{gate} slot {slot}"));
+                assert!(!dir.path().join("lock-target").exists(), "{case}");
+                assert_same_namespace(dir.path(), &before, &case);
             }
         }
     }

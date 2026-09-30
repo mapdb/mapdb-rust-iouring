@@ -75,9 +75,12 @@ pub(crate) fn read_prefix_unlocked(path: &Path, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// `true` when the store at `path` has no lock sidecar (copied without it, or
-/// created before T1.5). Opening such a store must create the sidecar to lock
-/// it, so `open_path` first probes the open-time format gates read-only and
+/// `true` when opening the store at `path` would have to **create** a lock
+/// sidecar file: the sidecar is absent (copied without it, or created before
+/// T1.5) or is a dangling symlink, whose target `acquire_lock`'s
+/// `create(true)` would mint. `metadata` follows the link exactly as that open
+/// does, so the predicate matches what lock acquisition creates. Opening such a
+/// store must create a file to lock it, so `open_path` first probes the open-time format gates read-only and
 /// refuses an unsupported format *without* minting the sidecar. The probe only
 /// ever refuses; it grants nothing, so it cannot weaken the lock: a probe that
 /// passes (or is inconclusive) falls through to the normal locked open, which
@@ -85,7 +88,7 @@ pub(crate) fn read_prefix_unlocked(path: &Path, len: usize) -> Option<Vec<u8>> {
 /// concurrently changes nothing — the probe mutates nothing either way.
 pub(crate) fn sidecar_missing(path: &Path) -> bool {
     matches!(
-        std::fs::symlink_metadata(lock_path(path)),
+        std::fs::metadata(lock_path(path)),
         Err(e) if e.kind() == io::ErrorKind::NotFound
     )
 }

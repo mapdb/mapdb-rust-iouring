@@ -263,7 +263,7 @@ mod tests {
     /// without a sidecar still creates and holds it.
     #[test]
     fn refusal_without_sidecar_does_not_create_one() {
-        for format in [3u8, 5] {
+        for (format, dangling) in [(3u8, false), (5, false), (3, true), (5, true)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("store.data");
             let store = Store::<Direct>::create_path(&path, Options::default()).unwrap();
@@ -275,12 +275,23 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
             std::fs::write(crate::compact::temp_path(&path), b"preserve").unwrap();
             std::fs::remove_file(lock_path(&path)).unwrap();
+            if dangling {
+                // A dangling sidecar symlink: locking would create its target.
+                std::os::unix::fs::symlink("lock-target", lock_path(&path)).unwrap();
+            }
             let snapshot = || -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+                use std::os::unix::ffi::OsStrExt;
                 std::fs::read_dir(dir.path())
                     .unwrap()
                     .map(|entry| {
                         let entry = entry.unwrap();
-                        (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                        let image = if entry.file_type().unwrap().is_symlink() {
+                            let target = std::fs::read_link(entry.path()).unwrap();
+                            [b"symlink:".as_slice(), target.as_os_str().as_bytes()].concat()
+                        } else {
+                            std::fs::read(entry.path()).unwrap()
+                        };
+                        (entry.file_name(), image)
                     })
                     .collect()
             };
@@ -291,14 +302,15 @@ mod tests {
             }
             assert!(
                 matches!(result, Err(OpenError::UnsupportedFormat { found, .. }) if found == format),
-                "format {format}: {:?}",
+                "format {format} dangling {dangling}: {:?}",
                 result.err()
             );
+            assert!(!dir.path().join("lock-target").exists());
             let after = snapshot();
             assert_eq!(
                 after.keys().collect::<Vec<_>>(),
                 before.keys().collect::<Vec<_>>(),
-                "format {format}: no sidecar may appear"
+                "format {format} dangling {dangling}: no sidecar may appear"
             );
             assert!(after == before, "format {format}: bytes changed");
         }

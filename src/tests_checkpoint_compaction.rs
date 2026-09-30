@@ -4238,3 +4238,66 @@ fn the_device_wrapper_decorates_every_role_minted_after_open() {
         );
     });
 }
+
+/// fable72 F1 (in-memory counterparts of `open_path`): an unsupported, torn or
+/// foreign in-force segment header refuses before `retire_other_segments` drops
+/// orphan segments and before the hosted helper removes a pending compaction
+/// temp.
+#[test]
+fn mem_open_helpers_refuse_segment_header_before_namespace_cleanup() {
+    use crate::compact::DataFileHost;
+    let host = MemDataHost::new(Arc::new(FakeIo::new(0)));
+    let fs = MemWalFileSet::new();
+    let store =
+        create_mem_store_hosted(Arc::clone(&host), Arc::clone(&fs), Options::default()).unwrap();
+    block_on(store.close()).unwrap();
+    let data = host.active().synced_bytes();
+    let seg0 = fs.segment(0).unwrap().synced_bytes();
+    let reseal = |img: &mut Vec<u8>| {
+        let crc = crc32c::crc32c(&img[..40]);
+        img[40..44].copy_from_slice(&crc.to_le_bytes());
+    };
+    let mut variants: Vec<(&str, Vec<u8>)> = Vec::new();
+    for format in [1u8, 3] {
+        let mut img = seg0.clone();
+        img[4] = format;
+        reseal(&mut img);
+        variants.push(("format", img));
+    }
+    let mut torn = seg0.clone();
+    torn[4] = 3;
+    variants.push(("torn", torn));
+    let mut foreign = seg0.clone();
+    foreign[16] ^= 0xff;
+    reseal(&mut foreign);
+    variants.push(("foreign", foreign));
+    for (kind, img) in variants {
+        for hosted in [false, true] {
+            let fresh = MemWalFileSet::new();
+            fresh.insert(0, Arc::new(FakeIo::from_vec(img.clone())));
+            fresh.insert(5, Arc::new(FakeIo::from_vec(seg0.clone())));
+            let result = if hosted {
+                let h = MemDataHost::new(Arc::new(FakeIo::from_vec(data.clone())));
+                h.create_temp().unwrap();
+                let r =
+                    open_mem_store_hosted(Arc::clone(&h), Arc::clone(&fresh), Options::default());
+                assert!(
+                    h.temp().is_some(),
+                    "{kind} hosted: temp must survive refusal"
+                );
+                r
+            } else {
+                let d: Arc<dyn PageIo> = Arc::new(FakeIo::from_vec(data.clone()));
+                open_mem_store(d, Arc::clone(&fresh), Options::default())
+            };
+            let err = result.err().expect("open must refuse");
+            let ok = match kind {
+                "format" => matches!(err, OpenError::UnsupportedFormat { .. }),
+                "torn" => matches!(err, OpenError::Corrupt(_)),
+                _ => matches!(err, OpenError::UuidMismatch),
+            };
+            assert!(ok, "{kind} hosted {hosted}: {err:?}");
+            assert_eq!(fresh.live_segments(), vec![0, 5], "{kind} hosted {hosted}");
+        }
+    }
+}
