@@ -398,13 +398,22 @@ pub async fn read_manifest(
 pub async fn read_winning_header(data: &dyn PageIo) -> Result<CheckpointHeader, OpenError> {
     let slot0 = data.read_exact_at(0, PAGE_SIZE).await?;
     let slot1 = data.read_exact_at(PAGE_SIZE as u64, PAGE_SIZE).await?;
+    pick_winning_header(&slot0, &slot1)
+}
+
+/// The winner policy of [`read_winning_header`] over two already-read slot
+/// images (pages 0 and 1).
+pub(crate) fn pick_winning_header(
+    slot0: &[u8],
+    slot1: &[u8],
+) -> Result<CheckpointHeader, OpenError> {
     let decode = |slot: &[u8]| match CheckpointHeader::decode(slot) {
         Ok(header) => Ok(Some(header)),
         Err(e @ OpenError::UnsupportedFormat { .. }) => Err(e),
         Err(_) => Ok(None),
     };
-    let h0 = decode(&slot0)?;
-    let h1 = decode(&slot1)?;
+    let h0 = decode(slot0)?;
+    let h1 = decode(slot1)?;
     match (h0, h1) {
         (None, None) => Err(OpenError::Corrupt("no valid checkpoint header slot")),
         (Some(h), None) | (None, Some(h)) => Ok(h),

@@ -32,7 +32,10 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::fs_util::{acquire_lock, fsync_parent_dir, CreateClaim};
+use crate::fs_util::{
+    acquire_lock, fsync_parent_dir, only_format_refusal, read_prefix_unlocked, sidecar_missing,
+    CreateClaim,
+};
 
 impl Store<Direct> {
     /// Creates a fresh StoreDirect at `path` under the durable creation protocol
@@ -160,6 +163,15 @@ impl Store<Direct> {
                 "store data file does not exist",
             )));
         }
+        // A store without its sidecar: refuse an unsupported format before
+        // `acquire_lock` mints one (fable72 F3). Read-only and refusal-only; the
+        // locked open below re-validates the header either way.
+        if sidecar_missing(path) {
+            if let Some(slots) = read_prefix_unlocked(path, 2 * PAGE_SIZE) {
+                let (a, b) = slots.split_at(PAGE_SIZE);
+                only_format_refusal(crate::direct::pick_winning_header(Ok(a), Ok(b)))?;
+            }
+        }
         let lock = acquire_lock(path)?;
         // Open the *existing* file only (never create): a file deleted between
         // the `exists()` check and here is reported as `NotFound`, not
@@ -244,6 +256,64 @@ mod tests {
                 assert_eq!(snapshot(), before, "refusal must preserve pre-existing files/bytes: format {format}, slot {damaged_slot}");
             }
         }
+    }
+
+    /// fable72 F3: a refused open of a Direct store with no lock sidecar
+    /// (copied without it, or pre-T1.5) must not create one; a supported open
+    /// without a sidecar still creates and holds it.
+    #[test]
+    fn refusal_without_sidecar_does_not_create_one() {
+        for format in [3u8, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store.data");
+            let store = Store::<Direct>::create_path(&path, Options::default()).unwrap();
+            block_on(store.close()).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[4] = format;
+            let crc = crc32c::crc32c(&bytes[..80]);
+            bytes[80..84].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::write(crate::compact::temp_path(&path), b"preserve").unwrap();
+            std::fs::remove_file(lock_path(&path)).unwrap();
+            let snapshot = || -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                    })
+                    .collect()
+            };
+            let before = snapshot();
+            let result = Store::<Direct>::open_path(&path, Options::default());
+            if let Ok(store) = &result {
+                block_on(store.close()).unwrap();
+            }
+            assert!(
+                matches!(result, Err(OpenError::UnsupportedFormat { found, .. }) if found == format),
+                "format {format}: {:?}",
+                result.err()
+            );
+            let after = snapshot();
+            assert_eq!(
+                after.keys().collect::<Vec<_>>(),
+                before.keys().collect::<Vec<_>>(),
+                "format {format}: no sidecar may appear"
+            );
+            assert!(after == before, "format {format}: bytes changed");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.data");
+        let store = Store::<Direct>::create_path(&path, Options::default()).unwrap();
+        block_on(store.close()).unwrap();
+        std::fs::remove_file(lock_path(&path)).unwrap();
+        let store = Store::<Direct>::open_path(&path, Options::default()).unwrap();
+        assert!(lock_path(&path).exists());
+        assert!(matches!(
+            Store::<Direct>::open_path(&path, Options::default()),
+            Err(OpenError::AlreadyOpen)
+        ));
+        block_on(store.close()).unwrap();
     }
 
     #[test]

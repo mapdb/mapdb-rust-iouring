@@ -62,6 +62,45 @@ fn flock_exclusive_nb(lock: &File) -> Result<(), OpenError> {
     Ok(())
 }
 
+/// Reads the first `len` bytes of an existing `path` through a read-only,
+/// non-creating handle, **without** the sidecar lock; `None` on any failure
+/// (missing, short, unreadable). Only for the pre-lock refusal probe
+/// ([`sidecar_missing`]), whose sole power is to refuse: whatever it reads is
+/// re-read and re-validated under the lock before anything is trusted.
+pub(crate) fn read_prefix_unlocked(path: &Path, len: usize) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let file = OpenOptions::new().read(true).open(path).ok()?;
+    let mut buf = vec![0u8; len];
+    file.read_exact_at(&mut buf, 0).ok()?;
+    Some(buf)
+}
+
+/// `true` when the store at `path` has no lock sidecar (copied without it, or
+/// created before T1.5). Opening such a store must create the sidecar to lock
+/// it, so `open_path` first probes the open-time format gates read-only and
+/// refuses an unsupported format *without* minting the sidecar. The probe only
+/// ever refuses; it grants nothing, so it cannot weaken the lock: a probe that
+/// passes (or is inconclusive) falls through to the normal locked open, which
+/// re-validates every gate under the lock. A sidecar that appears
+/// concurrently changes nothing — the probe mutates nothing either way.
+pub(crate) fn sidecar_missing(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(lock_path(path)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound
+    )
+}
+
+/// Maps a pre-lock probe verdict: an authenticated format refusal propagates;
+/// every other outcome (a torn slot, an I/O error, a concurrent writer's
+/// in-flight state) is inconclusive and left to the locked open to judge.
+pub(crate) fn only_format_refusal<T>(r: Result<T, OpenError>) -> Result<Option<T>, OpenError> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e @ OpenError::UnsupportedFormat { .. }) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Acquires the exclusive sidecar lock for **open** (creating the sidecar if
 /// absent — an open of a pre-T1.5 store may find none), or
 /// [`OpenError::AlreadyOpen`] if held. The returned `File` keeps the flock

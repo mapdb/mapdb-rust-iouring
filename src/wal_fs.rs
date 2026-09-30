@@ -39,7 +39,10 @@ pub(crate) fn segment_path(path: &Path, seq: u64) -> PathBuf {
     PathBuf::from(s)
 }
 
-use crate::fs_util::{acquire_lock, fsync_parent_dir, CreateClaim};
+use crate::fs_util::{
+    acquire_lock, fsync_parent_dir, only_format_refusal, read_prefix_unlocked, sidecar_missing,
+    CreateClaim,
+};
 
 /// Whether ANY `<stem>.wal.<digits>` segment exists for `path` — the WAL
 /// member classification of the fail-safe create (T1.5). Scans the directory
@@ -154,6 +157,26 @@ impl WalFileSet for FsWalFileSet {
         }
         Ok(removed)
     }
+}
+
+/// The pre-lock format probe for a store with no sidecar ([`sidecar_missing`]):
+/// read-only, it refuses only an authenticated unsupported data-header or
+/// in-force segment-header format; anything else is left to the locked open.
+fn refuse_unsupported_format_unlocked(path: &Path) -> Result<(), OpenError> {
+    use crate::page::PAGE_SIZE;
+    let Some(slots) = read_prefix_unlocked(path, 2 * PAGE_SIZE) else {
+        return Ok(());
+    };
+    let (slot0, slot1) = slots.split_at(PAGE_SIZE);
+    let Some(header) = only_format_refusal(crate::checkpoint::pick_winning_header(slot0, slot1))?
+    else {
+        return Ok(());
+    };
+    let seg = segment_path(path, header.wal_segment_seq);
+    if let Some(bytes) = read_prefix_unlocked(&seg, PAGE_SIZE) {
+        only_format_refusal(crate::wal::decode_wal_header(&bytes))?;
+    }
+    Ok(())
 }
 
 impl Store<Wal> {
@@ -308,6 +331,11 @@ impl Store<Wal> {
                 io::ErrorKind::NotFound,
                 "store data file does not exist",
             )));
+        }
+        // A store without its sidecar: refuse an unsupported format before
+        // `acquire_lock` mints one (fable72 F3).
+        if sidecar_missing(path) {
+            refuse_unsupported_format_unlocked(path)?;
         }
         let lock = acquire_lock(path)?;
         let data: Arc<dyn PageIo> = factory.open_existing(path, FileRole::Data)?;
@@ -1161,6 +1189,48 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// fable72 F3: a refused open of a store that has no lock sidecar (copied
+    /// without it, or pre-T1.5) must not create one. Covers both WAL open-time
+    /// version gates: the checkpoint (data) header and the segment header.
+    #[test]
+    fn refusal_without_sidecar_does_not_create_one() {
+        use crate::checkpoint::FORMAT_V3;
+        use crate::page::PAGE_SIZE;
+        for gate in ["data header", "WAL segment header"] {
+            for slot in 0..2 {
+                let dir = tempfile::tempdir().unwrap();
+                let path = store_with_leftovers(dir.path());
+                if gate == "data header" {
+                    let mut data = std::fs::read(&path).unwrap();
+                    let mut image = crate::checkpoint::CheckpointHeader::decode(&data[..PAGE_SIZE])
+                        .unwrap()
+                        .encode();
+                    image[4] = FORMAT_V3 + 1;
+                    let crc = crc32c::crc32c(&image[..124]);
+                    image[124..128].copy_from_slice(&crc.to_le_bytes());
+                    data[slot * PAGE_SIZE..(slot + 1) * PAGE_SIZE].copy_from_slice(&image);
+                    std::fs::write(&path, data).unwrap();
+                } else if slot == 0 {
+                    edit_segment_header(&path, true, |h| h[4] = 3);
+                } else {
+                    continue;
+                }
+                std::fs::remove_file(lock_path(&path)).unwrap();
+                let before = namespace_images(dir.path());
+                let result = Store::<Wal>::open_path(&path, Options::default());
+                if let Ok(store) = &result {
+                    block_on(store.close()).unwrap();
+                }
+                assert!(
+                    matches!(result, Err(OpenError::UnsupportedFormat { component, .. }) if component == gate),
+                    "{gate} slot {slot}: {:?}",
+                    result.err()
+                );
+                assert_same_namespace(dir.path(), &before, &format!("{gate} slot {slot}"));
+            }
+        }
     }
 
     /// The supported path keeps its cleanup: orphan segments and the compaction
