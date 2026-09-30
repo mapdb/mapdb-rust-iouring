@@ -89,18 +89,21 @@ pub fn decode_wal_header(bytes: &[u8]) -> Result<([u8; 16], u64, u32), OpenError
     if rd_u32(hdr::OFF_MAGIC) != hdr::WAL_MAGIC {
         return Err(OpenError::Corrupt("bad wal segment header magic"));
     }
+    // Authenticate the format byte before treating it as a version claim (as
+    // the checkpoint header does): a torn header is `Corrupt`, not a refusal.
+    let stored = rd_u32(hdr::OFF_HEADER_CKSUM);
+    if crc32c::crc32c(&bytes[..hdr::OFF_HEADER_CKSUM]) != stored {
+        return Err(OpenError::Corrupt("wal segment header checksum mismatch"));
+    }
     // Older or future-release segment header: refuse at open, before any mutation
-    // (M6 Phase H forward policy).
+    // (M6 Phase H forward policy; `open_path` validates the segment header before
+    // its namespace cleanup).
     OpenError::check_open_format("WAL segment header", bytes[hdr::OFF_FORMAT], hdr::FORMAT_V2)?;
     if bytes[hdr::OFF_ALGO] != hdr::ALGO_CRC32C {
         return Err(OpenError::Corrupt("unsupported wal checksum algorithm"));
     }
     if rd_u32(hdr::OFF_PAGE_SIZE) != PAGE_SIZE as u32 {
         return Err(OpenError::Corrupt("unsupported wal page size"));
-    }
-    let stored = rd_u32(hdr::OFF_HEADER_CKSUM);
-    if crc32c::crc32c(&bytes[..hdr::OFF_HEADER_CKSUM]) != stored {
-        return Err(OpenError::Corrupt("wal segment header checksum mismatch"));
     }
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&bytes[hdr::OFF_STORE_UUID..hdr::OFF_STORE_UUID + 16]);
@@ -654,6 +657,50 @@ pub struct Recovered {
     pub wal_segment_seq: u64,
 }
 
+/// Segment identity: the WAL handed to recovery must be *the* segment the
+/// winning header `h` names, chained from the seed it recorded, and of a
+/// supported segment-header format. A mismatch means the caller paired the
+/// wrong files (or a stale segment survived a cutover) — never scan it as if it
+/// were the right one. Returns the segment's size.
+///
+/// Read-only. The file-backed open runs it **before** any namespace cleanup
+/// (orphan-segment retirement, compaction-temp removal), so every
+/// segment-header refusal — format, identity, scan origin — leaves the
+/// namespace untouched; recovery re-runs it as its own authority.
+pub(crate) async fn check_segment_identity(
+    h: &crate::checkpoint::CheckpointHeader,
+    wal: &dyn PageIo,
+) -> Result<u64, OpenError> {
+    let wal_size = wal.size().await?;
+    if wal_size < WAL_HEADER_LEN {
+        return Err(OpenError::Corrupt("wal segment shorter than its header"));
+    }
+    let header_bytes = wal.read_exact_at(0, PAGE_SIZE).await?;
+    let (wal_uuid, segment_seq, seed) = decode_wal_header(&header_bytes)?;
+    if h.store_uuid != wal_uuid {
+        return Err(OpenError::UuidMismatch);
+    }
+    if segment_seq != h.wal_segment_seq {
+        return Err(OpenError::Corrupt(
+            "wal segment seq is not the one the data header names",
+        ));
+    }
+    if seed != h.wal_chain_seed {
+        return Err(OpenError::Corrupt(
+            "wal segment chain seed disagrees with the data header",
+        ));
+    }
+    // The origin must name a real position in *this* segment. Every header the
+    // engine writes uses exactly `WAL_HEADER_LEN`, so anything else is
+    // corruption; an unbounded origin would otherwise open "successfully" and
+    // seed the append frontier and meter past the end of the file, failing
+    // every subsequent write with `StoreFull`.
+    if h.wal_scan_origin < WAL_HEADER_LEN || h.wal_scan_origin > wal_size {
+        return Err(OpenError::Corrupt("wal scan origin outside the segment"));
+    }
+    Ok(wal_size)
+}
+
 /// Resolves the winning data header, validates that `wal` is exactly the segment
 /// it names, and scans that segment from the header's scan origin for the longest
 /// valid committed prefix of records `> checkpoint_txid`. Read-only and
@@ -673,37 +720,8 @@ pub fn recover(data: &Arc<dyn PageIo>, wal: &Arc<dyn PageIo>) -> Result<Recovere
         //    the two slots (a torn just-written slot loses to its predecessor).
         let h = crate::checkpoint::read_winning_header(&**data).await?;
 
-        // 2. Segment identity: the WAL handed to us must be *the* segment the
-        //    header names, chained from the seed it recorded. A mismatch means the
-        //    caller paired the wrong files (or a stale segment survived a
-        //    cutover) — never scan it as if it were the right one.
-        let wal_size = wal.size().await?;
-        if wal_size < WAL_HEADER_LEN {
-            return Err(OpenError::Corrupt("wal segment shorter than its header"));
-        }
-        let header_bytes = wal.read_exact_at(0, PAGE_SIZE).await?;
-        let (wal_uuid, segment_seq, seed) = decode_wal_header(&header_bytes)?;
-        if h.store_uuid != wal_uuid {
-            return Err(OpenError::UuidMismatch);
-        }
-        if segment_seq != h.wal_segment_seq {
-            return Err(OpenError::Corrupt(
-                "wal segment seq is not the one the data header names",
-            ));
-        }
-        if seed != h.wal_chain_seed {
-            return Err(OpenError::Corrupt(
-                "wal segment chain seed disagrees with the data header",
-            ));
-        }
-        // The origin must name a real position in *this* segment. Every header the
-        // engine writes uses exactly `WAL_HEADER_LEN`, so anything else is
-        // corruption; an unbounded origin would otherwise open "successfully" and
-        // seed the append frontier and meter past the end of the file, failing
-        // every subsequent write with `StoreFull`.
-        if h.wal_scan_origin < WAL_HEADER_LEN || h.wal_scan_origin > wal_size {
-            return Err(OpenError::Corrupt("wal scan origin outside the segment"));
-        }
+        // 2. Segment identity (see `check_segment_identity`).
+        let wal_size = check_segment_identity(&h, &**wal).await?;
 
         // 3. The manifest: seeds the locator base, the root-resolve checksums, and
         //    (with the header's `F`) the allocator.
@@ -1900,5 +1918,19 @@ mod tests {
             decode_wal_header(&bad_magic),
             Err(OpenError::Corrupt("bad wal segment header magic"))
         ));
+
+        // An unsealed format byte is a torn header, not a version claim: the
+        // CRC is checked before the format (as for the checkpoint header).
+        for byte in [1u8, 3, 255] {
+            let mut torn = good.to_vec();
+            torn[hdr::OFF_FORMAT] = byte;
+            assert!(
+                matches!(
+                    decode_wal_header(&torn),
+                    Err(OpenError::Corrupt("wal segment header checksum mismatch"))
+                ),
+                "unsealed format byte {byte} must be Corrupt"
+            );
+        }
     }
 }

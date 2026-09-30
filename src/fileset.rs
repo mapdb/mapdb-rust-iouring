@@ -158,6 +158,8 @@ pub fn open_mem_store(
 ) -> Result<crate::store::Store<crate::backend::Wal>, OpenError> {
     let header = futures_lite::future::block_on(crate::checkpoint::read_winning_header(&*data))?;
     let wal = file_set.open_segment(header.wal_segment_seq)?;
+    // Every segment-header refusal precedes namespace cleanup, as in `open_path`.
+    futures_lite::future::block_on(crate::wal::check_segment_identity(&header, &*wal))?;
     // Complete any rotation a crash interrupted before its unlink.
     file_set.retire_other_segments(header.wal_segment_seq)?;
     crate::store::Store::<crate::backend::Wal>::open_owned(
@@ -183,6 +185,7 @@ pub fn open_mem_store_hosted(
     let data = host.active() as Arc<dyn PageIo>;
     let header = futures_lite::future::block_on(crate::checkpoint::read_winning_header(&*data))?;
     let wal = file_set.open_segment(header.wal_segment_seq)?;
+    futures_lite::future::block_on(crate::wal::check_segment_identity(&header, &*wal))?;
     file_set.retire_other_segments(header.wal_segment_seq)?;
     // Active-path-wins: discard any temp a "crash" left mid-compaction.
     use crate::compact::DataFileHost;

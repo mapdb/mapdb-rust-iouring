@@ -316,9 +316,6 @@ impl Store<Wal> {
         // same bytes — the file is not written until the writer starts).
         let header =
             futures_lite::future::block_on(crate::checkpoint::read_winning_header(&*data))?;
-        // Active-path-wins only after the format gate: a downgrade refusal must
-        // preserve even an orphaned compaction image (M6 Phase D).
-        crate::compact::remove_stale_temp(path)?;
         let wpath = segment_path(path, header.wal_segment_seq);
         if !wpath.exists() {
             return Err(OpenError::from(io::Error::new(
@@ -327,6 +324,14 @@ impl Store<Wal> {
             )));
         }
         let wal: Arc<dyn PageIo> = factory.open_existing(&wpath, FileRole::WalSegment)?;
+        // Every open-time gate — the data-header format above, then the segment
+        // header's format and identity here — refuses before the namespace
+        // cleanup below: a downgrade refusal must preserve even an orphaned
+        // compaction image or a newer release's segments (M6 Phase D/H, fable72
+        // F1). Recovery re-runs the same check as its own authority.
+        futures_lite::future::block_on(crate::wal::check_segment_identity(&header, &*wal))?;
+        // Active-path-wins: remove an orphaned compaction temp.
+        crate::compact::remove_stale_temp(path)?;
         let file_set = Arc::new(FsWalFileSet {
             path: path.to_path_buf(),
             factory: factory.clone(),
@@ -1027,5 +1032,166 @@ mod tests {
         });
         block_on(map.close()).unwrap();
         cleanup(&path);
+    }
+
+    /// Every pre-existing file name and byte in `dir` (the lock sidecar included).
+    fn namespace_images(dir: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    /// Asserts `dir` holds exactly the names in `before`, each byte-identical
+    /// (names compared first so a failure reports them, not megabytes of bytes).
+    fn assert_same_namespace(
+        dir: &Path,
+        before: &std::collections::BTreeMap<std::ffi::OsString, Vec<u8>>,
+        case: &str,
+    ) {
+        let after = namespace_images(dir);
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>(),
+            "{case}: refusal must preserve every pre-existing file name and create none"
+        );
+        for (name, bytes) in before {
+            assert!(after[name] == *bytes, "{case}: {name:?} bytes changed");
+        }
+    }
+
+    /// A closed fresh StoreWal plus the leftovers an interrupted rotation /
+    /// compaction (or a newer release) may leave: two unreferenced segments and a
+    /// compaction temp. Every one of them is destroyed by a *successful* open.
+    fn store_with_leftovers(dir: &Path) -> PathBuf {
+        let path = dir.join("store");
+        let store = Store::<Wal>::create_path(&path, Options::default()).unwrap();
+        block_on(store.close()).unwrap();
+        std::fs::copy(segment_path(&path, 0), segment_path(&path, 1)).unwrap();
+        std::fs::write(segment_path(&path, 7), b"future segment").unwrap();
+        std::fs::write(crate::compact::temp_path(&path), b"preserve pending image").unwrap();
+        path
+    }
+
+    /// Rewrites the in-force segment header (seq 0) through `edit`, resealing its
+    /// CRC iff `reseal`.
+    fn edit_segment_header(path: &Path, reseal: bool, edit: impl FnOnce(&mut [u8])) {
+        let seg = segment_path(path, 0);
+        let mut bytes = std::fs::read(&seg).unwrap();
+        edit(&mut bytes[..crate::page::PAGE_SIZE]);
+        if reseal {
+            let crc = crc32c::crc32c(&bytes[..40]);
+            bytes[40..44].copy_from_slice(&crc.to_le_bytes());
+        }
+        std::fs::write(&seg, bytes).unwrap();
+    }
+
+    /// fable72 F1: the WAL *segment-header* gate (and the rest of the segment
+    /// identity check) refuses before `remove_stale_temp` and
+    /// `retire_other_segments` touch the namespace. An authenticated older/newer
+    /// format is `UnsupportedFormat`; an unsealed format byte is a torn header,
+    /// `Corrupt` (CRC before format, as for the checkpoint header); a foreign
+    /// store's segment is `UuidMismatch`. Every case leaves every pre-existing
+    /// file name and byte unchanged.
+    #[test]
+    fn segment_header_refusal_preserves_every_file_and_byte() {
+        type HeaderEdit = Box<dyn Fn(&mut [u8])>;
+        let mut cases: Vec<(String, bool, HeaderEdit)> = Vec::new();
+        for format in [0u8, 1, 3, 4, 255] {
+            cases.push((
+                format!("format {format}"),
+                true,
+                Box::new(move |h: &mut [u8]| h[4] = format),
+            ));
+        }
+        cases.push((
+            "torn format byte".into(),
+            false,
+            Box::new(|h: &mut [u8]| h[4] = 3),
+        ));
+        cases.push((
+            "foreign uuid".into(),
+            true,
+            Box::new(|h: &mut [u8]| h[16] ^= 0xff),
+        ));
+        cases.push((
+            "wrong segment seq".into(),
+            true,
+            Box::new(|h: &mut [u8]| h[32] = 9),
+        ));
+        // Collect every case's verdict so one run reports the whole matrix.
+        let mut failures = Vec::new();
+        for (name, reseal, edit) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = store_with_leftovers(dir.path());
+            edit_segment_header(&path, reseal, edit);
+            let before = namespace_images(dir.path());
+            let result = Store::<Wal>::open_path(&path, Options::default());
+            if let Ok(store) = &result {
+                block_on(store.close()).unwrap();
+            }
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{name}: open must refuse"));
+            let classified = match name.strip_prefix("format ") {
+                Some(f) => {
+                    let f: u8 = f.parse().unwrap();
+                    matches!(err, OpenError::UnsupportedFormat {
+                        component: "WAL segment header", found, supported: 2, newer
+                    } if found == f && newer == (f > 2))
+                }
+                None if name == "foreign uuid" => matches!(err, OpenError::UuidMismatch),
+                None => matches!(err, OpenError::Corrupt(_)),
+            };
+            if !classified {
+                failures.push(format!("{name}: wrong error {err:?}"));
+            }
+            let caught = std::panic::catch_unwind(|| {
+                assert_same_namespace(dir.path(), &before, &name);
+            });
+            if let Err(panic) = caught {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "namespace changed".into());
+                failures.push(msg);
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The supported path keeps its cleanup: orphan segments and the compaction
+    /// temp are removed, the store writes, and it reopens — with and without a
+    /// pre-existing sidecar (a missing one is created and locked as before).
+    #[test]
+    fn supported_open_still_retires_leftovers() {
+        for drop_sidecar in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = store_with_leftovers(dir.path());
+            if drop_sidecar {
+                std::fs::remove_file(lock_path(&path)).unwrap();
+            }
+            let map = BTreeMap::over(Store::<Wal>::open_path(&path, Options::default()).unwrap());
+            assert!(lock_path(&path).exists());
+            assert!(!crate::compact::temp_path(&path).exists());
+            assert!(!segment_path(&path, 1).exists());
+            assert!(!segment_path(&path, 7).exists());
+            assert!(segment_path(&path, 0).exists());
+            assert!(matches!(
+                Store::<Wal>::open_path(&path, Options::default()),
+                Err(OpenError::AlreadyOpen)
+            ));
+            block_on(map.apply(WriteBatch::new().insert(b"k".to_vec(), b"v".to_vec()))).unwrap();
+            block_on(map.close()).unwrap();
+            let map = BTreeMap::over(Store::<Wal>::open_path(&path, Options::default()).unwrap());
+            assert_eq!(
+                block_on(map.get(b"k".to_vec())).unwrap(),
+                Some(b"v".to_vec())
+            );
+            block_on(map.close()).unwrap();
+        }
     }
 }
