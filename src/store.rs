@@ -1165,14 +1165,7 @@ impl Store<Direct> {
                 "direct store shorter than its two header slots",
             ));
         }
-        let slot_a = futures_lite::future::block_on(
-            data.read_exact_at(crate::direct::DirectSlot::A.offset(), PAGE_SIZE),
-        );
-        let slot_b = futures_lite::future::block_on(
-            data.read_exact_at(crate::direct::DirectSlot::B.offset(), PAGE_SIZE),
-        );
-        let (header, stale_slot) =
-            crate::direct::pick_winning_header(slot_a.as_deref(), slot_b.as_deref())?;
+        let (header, stale_slot) = crate::direct::read_winning_header(data.as_ref())?;
         // `logical_tail` may legitimately exceed the device size: ids burned by
         // intra-batch superseded pages advance the persisted frontier without a
         // byte ever being written at their offsets (see `reopen_emptied_store`),

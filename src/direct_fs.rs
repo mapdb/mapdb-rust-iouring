@@ -17,8 +17,9 @@
 //! drains every admitted command, flushes, exits, and only *then* releases the
 //! lock — the path is never exposed to a second opener mid-drain. Compaction-temp naming and active-path-wins cleanup bind to
 //! this same seam (M6 Phase D, [`crate::compact`]): the temp is
-//! `<path>.compact.tmp`, and both constructors remove a stale one right after
-//! taking the lock — whatever it contains, it is by construction uncommitted.
+//! <path>.compact.tmp. Overwrite-create cleans it under the lock; existing-store
+//! open validates its Direct header slots first so format refusal preserves the
+//! image. Supported active-path-wins cleanup still precedes writer startup.
 
 use crate::backend::Direct;
 use crate::direct::generate_store_uuid;
@@ -160,8 +161,6 @@ impl Store<Direct> {
             )));
         }
         let lock = acquire_lock(path)?;
-        // Active-path-wins: remove an orphaned compaction temp (M6 Phase D).
-        crate::compact::remove_stale_temp(path)?;
         // Open the *existing* file only (never create): a file deleted between
         // the `exists()` check and here is reported as `NotFound`, not
         // re-created as a junk store.
@@ -173,6 +172,11 @@ impl Store<Direct> {
                 "store data file shorter than its two header pages",
             ));
         }
+        // Refuse unsupported Direct formats before destructive namespace
+        // cleanup. Reuse open_over's two-slot CRC/format/winner policy; no
+        // writer has started and the namespace lock is held throughout.
+        crate::direct::read_winning_header(dev.as_ref())?;
+        crate::compact::remove_stale_temp(path)?;
         // `open_over` reads + validates the header and rebuilds the allocator
         // frontier; the writer thread holds the lock until it exits (T1.2).
         let host = Arc::new(crate::compact::FsDataHost {
@@ -193,6 +197,90 @@ mod tests {
     use futures_lite::future::block_on;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn unsupported_direct_format_preserves_compaction_temp_and_all_bytes() {
+        for format in [0u8, 1, 2, 3, 5, 255] {
+            for damaged_slot in [0, 1, 2] {
+                // 2 means both slots
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("store.data");
+                let store = Store::<Direct>::create_path(&path, Options::default()).unwrap();
+                block_on(store.close()).unwrap();
+                let mut bytes = std::fs::read(&path).unwrap();
+                for slot in 0..2 {
+                    if damaged_slot != 2 && slot != damaged_slot {
+                        continue;
+                    }
+                    let base = slot * PAGE_SIZE;
+                    // Direct v4 header format byte and its layout-stable CRC.
+                    bytes[base + 4] = format;
+                    let crc = crc32c::crc32c(&bytes[base..base + 80]);
+                    bytes[base + 80..base + 84].copy_from_slice(&crc.to_le_bytes());
+                }
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::write(
+                    crate::compact::temp_path(&path),
+                    b"preserve future compaction image",
+                )
+                .unwrap();
+                let snapshot = || -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+                    std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|entry| {
+                            let entry = entry.unwrap();
+                            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                        })
+                        .collect()
+                };
+                let before = snapshot();
+                let result = Store::<Direct>::open_path(&path, Options::default());
+                if let Ok(store) = &result {
+                    block_on(store.close()).unwrap();
+                }
+                assert!(matches!(result, Err(OpenError::UnsupportedFormat {
+                    component: "direct header", found, supported: 4, newer
+                }) if found == format && newer == (format > 4)));
+                assert_eq!(snapshot(), before, "refusal must preserve pre-existing files/bytes: format {format}, slot {damaged_slot}");
+            }
+        }
+    }
+
+    #[test]
+    fn supported_direct_open_cleans_temp_with_torn_slot_fallback() {
+        for damaged_slot in [None, Some(0), Some(1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store.data");
+            let store = Store::<Direct>::create_path(&path, Options::default()).unwrap();
+            block_on(store.close()).unwrap();
+            if let Some(slot) = damaged_slot {
+                let mut bytes = std::fs::read(&path).unwrap();
+                // An unauthenticated newer-looking byte is slot damage.
+                bytes[slot * PAGE_SIZE + 4] = 255;
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let temp = crate::compact::temp_path(&path);
+            std::fs::write(&temp, b"discard supported-store stale image").unwrap();
+            let map =
+                BTreeMap::over(Store::<Direct>::open_path(&path, Options::default()).unwrap());
+            assert!(!temp.exists());
+            assert_eq!(map.len(), 0);
+            block_on(map.verify()).unwrap();
+            block_on(map.apply(WriteBatch::new().insert(b"k".to_vec(), b"v".to_vec()))).unwrap();
+            assert_eq!(
+                block_on(map.get(b"k".to_vec())).unwrap(),
+                Some(b"v".to_vec())
+            );
+            block_on(map.close()).unwrap();
+            let map =
+                BTreeMap::over(Store::<Direct>::open_path(&path, Options::default()).unwrap());
+            assert_eq!(
+                block_on(map.get(b"k".to_vec())).unwrap(),
+                Some(b"v".to_vec())
+            );
+            block_on(map.close()).unwrap();
+        }
+    }
 
     fn unique_path(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);

@@ -273,6 +273,18 @@ impl DirectSlot {
     }
 }
 
+/// Read both Direct header slots using the same winner/format policy as open.
+/// The caller has already checked the device holds both header pages.
+pub(crate) fn read_winning_header(
+    data: &dyn PageIo,
+) -> Result<(DirectHeader, DirectSlot), OpenError> {
+    let slot_a =
+        futures_lite::future::block_on(data.read_exact_at(DirectSlot::A.offset(), PAGE_SIZE));
+    let slot_b =
+        futures_lite::future::block_on(data.read_exact_at(DirectSlot::B.offset(), PAGE_SIZE));
+    pick_winning_header(slot_a.as_deref(), slot_b.as_deref())
+}
+
 /// Picks the winning header of a v4 store from its two slot images and names
 /// the **stale** slot the next flush must overwrite.
 ///
